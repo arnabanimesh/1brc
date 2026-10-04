@@ -138,7 +138,7 @@ public class CalculateAverage_arjenw {
 
         @Override
         public String toString() {
-            return STR."\{new String(data, 0, length, StandardCharsets.UTF_8)}=\{min / 10.0}/\{Math.round(((double) total) / count) / 10.0}/\{max / 10.0}";
+            return "%s={min / 10.0}/{Math.round(((double) total) / count) / 10.0}/{max / 10.0}".formatted(new String(data, 0, length, StandardCharsets.UTF_8));
         }
 
         private void append(int min, int max, int total, int count) {

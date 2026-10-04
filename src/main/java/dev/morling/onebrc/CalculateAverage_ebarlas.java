@@ -145,7 +145,7 @@ public class CalculateAverage_ebarlas {
             var merged = mergeFooterAndHeader(pPrev.footer, pNext.header);
             if (merged != null && merged.length != 0) {
                 if (merged[merged.length - 1] == '\n') { // fold into prev partition
-                    doProcessSegment(ARENA.allocateArray(ValueLayout.JAVA_BYTE, merged), 0, pPrev.stats, true);
+                    doProcessSegment(ARENA.allocateFrom(ValueLayout.JAVA_BYTE, merged), 0, pPrev.stats, true);
                 }
                 else { // no newline appeared in partition, carry forward
                     pNext.footer = merged;

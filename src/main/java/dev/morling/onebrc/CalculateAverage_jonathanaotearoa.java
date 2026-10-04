@@ -42,8 +42,9 @@ public class CalculateAverage_jonathanaotearoa {
             final Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
             theUnsafe.setAccessible(true);
             UNSAFE = (Unsafe) theUnsafe.get(null);
-        } catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(STR."Error getting instance of \{Unsafe.class.getName()}");
+        }
+        catch (NoSuchFieldException | IllegalAccessException e) {
+            throw new RuntimeException("Error getting instance of %s".formatted(Unsafe.class.getName()));
         }
     }
 
@@ -121,7 +122,7 @@ public class CalculateAverage_jonathanaotearoa {
      */
     private static SortedMap<String, TemperatureData> processFile(final Path filePath) throws IOException {
         assert filePath != null : "filePath cannot be null";
-        assert Files.isRegularFile(filePath) : STR."\{filePath.toAbsolutePath()} is not a valid file";
+        assert Files.isRegularFile(filePath) : "%s is not a valid file".formatted(filePath.toAbsolutePath());
 
         try (final FileChannel fc = FileChannel.open(filePath, StandardOpenOption.READ)) {
             final long fileSize = fc.size();
@@ -172,7 +173,7 @@ public class CalculateAverage_jonathanaotearoa {
      * @throws IOException if an error occurs mapping the file channel into memory.
      */
     private static SortedMap<String, TemperatureData> processFile(final FileChannel fc, final long fileSize) throws IOException {
-        assert fileSize >= WORD_BYTES : STR."File size cannot be less than word size \{WORD_BYTES}, but was \{fileSize}";
+        assert fileSize >= WORD_BYTES : "File size cannot be less than word size %s, but was {fileSize}".formatted(WORD_BYTES);
 
         try (final Arena arena = Arena.ofConfined()) {
             final long fileAddress = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, arena).address();
@@ -336,8 +337,8 @@ public class CalculateAverage_jonathanaotearoa {
         public Chunk(final long startAddress, final long lastByteAddress, final boolean isLast) {
             this(startAddress, lastByteAddress, lastByteAddress - (Long.BYTES - 1), isLast);
 
-            assert lastByteAddress > startAddress : STR."lastByteAddress \{lastByteAddress} must be > startAddress \{startAddress}";
-            assert lastWordAddress >= startAddress : STR."lastWordAddress \{lastWordAddress} must be >= startAddress \{startAddress}";
+            assert lastByteAddress > startAddress : "lastByteAddress %s must be > startAddress {startAddress}".formatted(lastByteAddress);
+            assert lastWordAddress >= startAddress : "lastWordAddress %s must be >= startAddress {startAddress}".formatted(lastWordAddress);
         }
 
         /**
@@ -351,8 +352,8 @@ public class CalculateAverage_jonathanaotearoa {
          * @return the word at the specified address.
          */
         public long getWord(final long address) {
-            assert address >= startAddress : STR."address must be >= startAddress \{startAddress}, but was \{address}";
-            assert address < lastByteAddress : STR."address must be < lastByteAddress \{lastByteAddress}, but was \{address}";
+            assert address >= startAddress : "address must be >= startAddress %s, but was {address}".formatted(startAddress);
+            assert address < lastByteAddress : "address must be < lastByteAddress %s, but was {address}".formatted(lastByteAddress);
 
             if (isLast && address > lastWordAddress) {
                 // Make sure we don't read beyond the end of the file and potentially crash the JVM.
@@ -563,23 +564,26 @@ public class CalculateAverage_jonathanaotearoa {
             final StringBuilder testResults = new StringBuilder();
             try (DirectoryStream<Path> dirStream = Files.newDirectoryStream(SAMPLE_DIR_PATH, "*.txt")) {
                 dirStream.forEach(filePath -> {
-                    testResults.append(STR."Testing '\{filePath.getFileName()}'... ");
+                    testResults.append("Testing '%s'... ".formatted(filePath.getFileName()));
                     final String expectedResultFileName = filePath.getFileName().toString().replace(".txt", ".out");
                     try {
                         final String expected = Files.readString(SAMPLE_DIR_PATH.resolve(expectedResultFileName));
                         final SortedMap<String, TemperatureData> results = processFile(filePath);
                         // Appending \n to the results string to mimic println().
-                        final String actual = STR."\{resultsToString(results)}\n";
+                        final String actual = "%s\n".formatted(resultsToString(results));
                         if (actual.equals(expected)) {
                             testResults.append("Passed\n");
-                        } else {
+                        }
+                        else {
                             testResults.append("Failed. Actual output does not match expected\n");
                         }
-                    } catch (IOException e) {
-                        throw new RuntimeException(STR."Error testing '\{filePath.getFileName()}");
+                    }
+                    catch (IOException e) {
+                        throw new RuntimeException("Error testing '%s".formatted(filePath.getFileName()));
                     }
                 });
-            } finally {
+            }
+            finally {
                 System.out.println(testResults);
             }
         }

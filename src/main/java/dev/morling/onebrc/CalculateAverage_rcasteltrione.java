@@ -197,7 +197,7 @@ public class CalculateAverage_rcasteltrione {
 
         @Override
         public String toString() {
-            return STR."\{round(min)}/\{round(((double) sum / n))}/\{round(max)}";
+            return "%s/{round(((double) sum / n))}/{round(max)}".formatted(round(min));
         }
 
         double round(double v) {

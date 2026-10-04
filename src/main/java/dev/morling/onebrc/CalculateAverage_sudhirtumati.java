@@ -45,11 +45,11 @@ public class CalculateAverage_sudhirtumati {
 
     private void chunkProcess() throws IOException, InterruptedException {
         try (FileInputStream is = new FileInputStream(FILE);
-             FileChannel fc = is.getChannel()) {
+                FileChannel fc = is.getChannel()) {
             for (int i = 0; i < THREAD_COUNT; i++) {
                 PERMITS.acquire();
                 Thread t = new ChunkProcessingThread(i, fc);
-                t.setName(STR."T\{i}");
+                t.setName("T%s".formatted(i));
                 t.start();
             }
             do {
@@ -293,7 +293,7 @@ public class CalculateAverage_sudhirtumati {
     private record ResultRow(double min, double sum, double count, double max) {
 
         public String toString() {
-            return STR."\{round(min)}/\{round((Math.round(sum * 10.0) / 10.0) / count)}/\{round(max)}";
+            return "%s/{round((Math.round(sum * 10.0) / 10.0) / count)}/{round(max)}".formatted(round(min));
         }
 
         private double round(double value) {

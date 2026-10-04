@@ -42,14 +42,11 @@ import jdk.incubator.vector.VectorOperators;
 public class CalculateAverage_jparera {
     private static final String FILE = "./measurements.txt";
 
-    private static final VarHandle BYTE_HANDLE = MethodHandles
-            .memorySegmentViewVarHandle(ValueLayout.JAVA_BYTE);
+    private static final VarHandle BYTE_HANDLE = ValueLayout.JAVA_BYTE.varHandle();
 
-    private static final VarHandle INT_HANDLE = MethodHandles
-            .memorySegmentViewVarHandle(ValueLayout.JAVA_INT_UNALIGNED);
+    private static final VarHandle INT_HANDLE = ValueLayout.JAVA_INT_UNALIGNED.varHandle();
 
-    private static final VarHandle LONG_LE_HANDLE = MethodHandles
-            .memorySegmentViewVarHandle(ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN));
+    private static final VarHandle LONG_LE_HANDLE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN).varHandle();
 
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED;
 

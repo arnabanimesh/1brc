@@ -422,7 +422,7 @@ public class CalculateAverage_C5H12O5 {
 
         @Override
         public String toString() {
-            return STR."\{min / 10.0}/\{Math.round((double) sum / count) / 10.0}/\{max / 10.0}";
+            return "%s/{Math.round((double) sum / count) / 10.0}/{max / 10.0}".formatted(min / 10.0);
         }
     }
 }

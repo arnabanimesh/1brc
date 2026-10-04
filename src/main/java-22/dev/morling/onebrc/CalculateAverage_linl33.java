@@ -52,14 +52,15 @@ public class CalculateAverage_linl33 {
             throw new UnsupportedOperationException("Error: BE JVMs are not supported");
         }
         if ((BYTE_SPECIES.vectorByteSize() & (BYTE_SPECIES.vectorByteSize() - 1)) != 0) {
-            throw new UnsupportedOperationException(STR."Unsupported vectorByteSize \{BYTE_SPECIES.vectorByteSize()}");
+            throw new UnsupportedOperationException("Unsupported vectorByteSize %s".formatted(BYTE_SPECIES.vectorByteSize()));
         }
 
         try {
             var f = Unsafe.class.getDeclaredField("theUnsafe");
             f.setAccessible(true);
             UNSAFE = (Unsafe) f.get(null);
-        } catch (NoSuchFieldException | IllegalAccessException e) {
+        }
+        catch (NoSuchFieldException | IllegalAccessException e) {
             throw new RuntimeException(e);
         }
     }

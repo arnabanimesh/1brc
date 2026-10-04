@@ -101,7 +101,8 @@ public class CalculateAverage_gabrielreid {
 
                     try {
                         blockBuilder = blockBuilderQueue.poll(1, TimeUnit.HOURS);
-                    } catch (InterruptedException e) {
+                    }
+                    catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         throw new RuntimeException(e);
                     }
@@ -113,7 +114,8 @@ public class CalculateAverage_gabrielreid {
                 BlockBuilder blockBuilder;
                 try {
                     blockBuilder = blockBuilderQueue.poll(1, TimeUnit.HOURS);
-                } catch (InterruptedException e) {
+                }
+                catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new RuntimeException(e);
                 }
@@ -126,12 +128,13 @@ public class CalculateAverage_gabrielreid {
             });
 
             var state = stateFuture.join();
-            System.out.println(STR."{\{state.map.entrySet().stream().sorted(Map.Entry.comparingByKey())
+            System.out.println("{%s}".formatted(state.map.entrySet().stream().sorted(Map.Entry.comparingByKey())
                     .map(e -> String.format(Locale.US, "%s=%.1f/%.1f/%.1f", e.getKey(), e.getValue().min / 10f,
                             (e.getValue().sum / (float) e.getValue().count) / 10f, e.getValue().max / 10f))
-                    .collect(Collectors.joining(", "))}}");
+                    .collect(Collectors.joining(", "))));
 
-    }}
+        }
+    }
 
     /**
      * Parses number values as integers from the byte array.

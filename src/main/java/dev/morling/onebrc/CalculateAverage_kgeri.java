@@ -58,9 +58,9 @@ public class CalculateAverage_kgeri {
         }
 
         @Override
-		public String toString() {
-			return STR."\{round(min)}/\{round(sum / count)}/\{round(max)}";
-		}
+        public String toString() {
+            return "%s/{round(sum / count)}/{round(max)}".formatted(round(min));
+        }
 
         private double round(double value) {
             return Math.round(value * 10.0) / 10.0;

@@ -62,7 +62,7 @@ public class CalculateAverage_tonivade {
                     partialResult.merge(result);
                 }
                 else {
-                    try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+                    try (var scope = StructuredTaskScope.open()) {
                         var tasks = new ArrayList<Subtask<PartialResult>>(chunks);
                         for (int i = 0; i < chunks; i++) {
                             int start = i * chunkSize;
@@ -70,7 +70,6 @@ public class CalculateAverage_tonivade {
                             tasks.add(scope.fork(new Chunk(buffer, start, length)::read));
                         }
                         scope.join();
-                        scope.throwIfFailed();
 
                         for (var subtask : tasks) {
                             subtask.get().merge(result);

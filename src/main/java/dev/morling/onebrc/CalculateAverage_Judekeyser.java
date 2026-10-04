@@ -46,23 +46,194 @@ public class CalculateAverage_Judekeyser {
 
     private static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
 
-    public static void main(String[] args) throws Exception {
-        class SimpleStatistics {
-            int min, max, sum, count;
-            SimpleStatistics() {
-                min = Integer.MAX_VALUE;
-                max = Integer.MIN_VALUE;
-                sum = 0;
-                count = 0;
-            }
+    static class Name {
+        final int[] data;
+        final int hash;
 
-            void accept(int value) {
-                min = Math.min(min, value);
-                max = Math.max(max, value);
-                sum += value;
-                count++;
+        Name(int[] data) {
+            this.data = data;
+            {
+                var hash = 0;
+                for (var d : data) {
+                    hash = 31 * hash + d;
+                }
+                this.hash = hash;
             }
         }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (obj == this)
+                return true;
+            else if (obj instanceof Name name && name.data.length == data.length) {
+                int size = 0;
+                while (size < data.length) {
+                    if (data[size] != name.data[size]) {
+                        return false;
+                    }
+                    else
+                        size++;
+                }
+                return true;
+            }
+            else
+                return false;
+        }
+
+        @Override
+        public String toString() {
+            var bdata = new byte[data.length * 4];
+            int j = 0;
+            for (int i = 0; i < data.length; i++) {
+                bdata[j++] = (byte) ((data[i] >>> 0) & 255);
+                bdata[j++] = (byte) ((data[i] >>> 8) & 255);
+                bdata[j++] = (byte) ((data[i] >>> 16) & 255);
+                bdata[j++] = (byte) ((data[i] >>> 24) & 255);
+            }
+            while (bdata[--j] == 0)
+                ;
+            return new String(bdata, 0, j + 1, StandardCharsets.UTF_8);
+        }
+    }
+
+    record Line(Name name, int value) {
+    }
+
+    static class It implements Iterator<Line> {
+        int offset;
+        final int length;
+        final MemorySegment memorySegment;
+        final ByteOrder endian;
+
+        It(MemorySegment memorySegment) {
+            offset = 0;
+            endian = ByteOrder.nativeOrder();
+            this.memorySegment = memorySegment;
+            length = (int) memorySegment.byteSize();
+            assert '\n' == memorySegment.get(JAVA_BYTE, length - 1);
+        }
+
+        @Override
+        public boolean hasNext() {
+            return offset < length;
+        }
+
+        @Override
+        public Line next() {
+            int size;
+            b: {
+                /*
+                 * Vectorization does not seem to bring anything interesting.
+                 * This is a bit disappointing. What am I doing wrong?
+                 */
+
+                size = 0;
+
+                while (offset + size + SPECIES.length() <= length) {
+                    var vector = ByteVector.fromMemorySegment(
+                            SPECIES, memorySegment,
+                            offset + size, endian);
+                    var j = vector.eq((byte) '\n').firstTrue();
+                    if (j < SPECIES.length()) {
+                        assert j >= 0;
+                        size += j;
+                        assert memorySegment.get(JAVA_BYTE, offset + size) == '\n';
+                        break b;
+                    }
+                    else {
+                        assert j == SPECIES.length();
+                        size += SPECIES.length();
+                    }
+                }
+                {
+                    byte b;
+                    for (; size < 128; size++) {
+                        b = memorySegment.get(JAVA_BYTE, offset + size);
+                        if (b == '\n')
+                            break b;
+                    }
+                    assert false : "Lines are smaller than 128 bytes";
+                }
+                assert memorySegment.get(JAVA_BYTE, offset + size) == '\n';
+                assert size < 128;
+            }
+
+            Name name;
+            int value;
+            {
+                long cursor = offset + size - 1L;
+                {
+                    value = memorySegment.get(JAVA_BYTE, cursor) - '0';
+                    value += (memorySegment.get(JAVA_BYTE, cursor - 2L) - '0') * 10;
+                    cursor -= 3L;
+                    if (memorySegment.get(JAVA_BYTE, cursor) == '-') {
+                        value *= -1;
+                        cursor -= 1L;
+                    }
+                    else if (memorySegment.get(JAVA_BYTE, cursor) != ';') {
+                        value += (memorySegment.get(JAVA_BYTE, cursor) - '0') * 100;
+                        cursor -= 1L;
+                        if (memorySegment.get(JAVA_BYTE, cursor) == '-') {
+                            value *= -1;
+                            cursor -= 1L;
+                        }
+                    }
+                }
+                // var data = memorySegment.asSlice(offset, cursor-offset).toArray(JAVA_BYTE);
+                // System.arraycopy(chunk, 0, data, 0, data.length);
+                // assert ';' != data[data.length - 1];
+                // name = new Name(data);
+                {
+                    int mod4StringSize = ((int) (cursor - offset + 3)) / 4 * 4;
+                    var data = memorySegment.asSlice(offset, mod4StringSize).toArray(JAVA_INT_UNALIGNED);
+                    switch (((int) (cursor - offset)) % 4) {
+                        case 0:
+                            break;
+                        case 1: {
+                            data[data.length - 1] &= 255;
+                        }
+                            break;
+                        case 2: {
+                            data[data.length - 1] &= 65535;
+                        }
+                            break;
+                        case 3: {
+                            data[data.length - 1] &= 16777215;
+                        }
+                            break;
+                    }
+                    name = new Name(data);
+                }
+            }
+            offset += size + 1;
+            return new Line(name, value);
+        }
+    }
+
+    static class SimpleStatistics {
+        int min, max, sum, count;
+
+        SimpleStatistics() {
+            min = Integer.MAX_VALUE;
+            max = Integer.MIN_VALUE;
+            sum = 0;
+            count = 0;
+        }
+
+        void accept(int value) {
+            min = Math.min(min, value);
+            max = Math.max(max, value);
+            sum += value;
+            count++;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
         class Statistics {
             double min, max, avg;
             long count;
@@ -89,62 +260,13 @@ public class CalculateAverage_Judekeyser {
             }
             @Override
             public String toString() {
-                return STR."\{format.format(round(min))}/\{format.format(round(avg))}/\{format.format(round(max))}";
+                return "%s/{format.format(round(avg))}/{format.format(round(max))}".formatted(format.format(round(min)));
             }
 
             static double round(double d) {
                 return Math.round(d*10.)/10.;
             }
         }
-        class Name {
-            final int[] data;
-            final int hash;
-            Name(int[] data) {
-                this.data = data;
-                {
-                    var hash = 0;
-                    for (var d : data) {
-                        hash = 31 * hash + d;
-                    }
-                    this.hash = hash;
-                }
-            }
-
-            @Override
-            public int hashCode() {
-                return hash;
-            }
-
-            @Override
-            public boolean equals(Object obj) {
-                if(obj == this) return true;
-                else if(obj instanceof Name name && name.data.length == data.length) {
-                    int size  = 0;
-                    while(size < data.length) {
-                        if(data[size] != name.data[size]) {
-                            return false;
-                        } else size++;
-                    }
-                    return true;
-                } else return false;
-            }
-
-            @Override
-            public String toString() {
-                var bdata = new byte[data.length * 4];
-                int j = 0;
-                for(int i = 0;i < data.length; i++) {
-                    bdata[j++] = (byte)((data[i] >>>  0) & 255);
-                    bdata[j++] = (byte)((data[i] >>>  8) & 255);
-                    bdata[j++] = (byte)((data[i] >>> 16) & 255);
-                    bdata[j++] = (byte)((data[i] >>> 24) & 255);
-                }
-                while(bdata[--j] == 0);
-                return new String(bdata, 0, j+1, StandardCharsets.UTF_8);
-            }
-        }
-
-        record Line(Name name, int value) {}
 
         var results = new HashMap<Name, Statistics>();
         try(var file = new RandomAccessFile(Paths.get(FILE).toFile(), "r")) {
@@ -198,111 +320,6 @@ public class CalculateAverage_Judekeyser {
                 @Override
                 public boolean hasNext() {
                     return offset < length;
-                }
-            }
-
-            class It implements Iterator<Line> {
-                int offset;
-                final int length;
-                final MemorySegment memorySegment;
-                final ByteOrder endian;
-
-                It(MemorySegment memorySegment) {
-                    offset = 0;
-                    endian = ByteOrder.nativeOrder();
-                    this.memorySegment = memorySegment;
-                    length = (int) memorySegment.byteSize();
-                    assert '\n' == memorySegment.get(JAVA_BYTE, length - 1);
-                }
-
-                @Override
-                public boolean hasNext() {
-                    return offset < length;
-                }
-
-                @Override
-                public Line next() {
-                    int size;
-                    b: {
-                        /*
-                         * Vectorization does not seem to bring anything interesting.
-                         * This is a bit disappointing. What am I doing wrong?
-                         */
-
-                        size = 0;
-
-                        while (offset+size+SPECIES.length() <= length) {
-                            var vector = ByteVector.fromMemorySegment(
-                                    SPECIES, memorySegment,
-                                    offset+size, endian
-                            );
-                            var j = vector.eq((byte) '\n').firstTrue();
-                            if (j < SPECIES.length()) {
-                                assert j >= 0;
-                                size += j;
-                                assert memorySegment.get(JAVA_BYTE, offset+size) == '\n';
-                                break b;
-                            } else {
-                                assert j == SPECIES.length();
-                                size += SPECIES.length();
-                            }
-                        }
-                        {
-                            byte b;
-                            for (; size < 128; size++) {
-                                b = memorySegment.get(JAVA_BYTE, offset+size);
-                                if (b == '\n') break b;
-                            }
-                            assert false : "Lines are smaller than 128 bytes";
-                        }
-                        assert memorySegment.get(JAVA_BYTE, offset+size) == '\n';
-                        assert size < 128;
-                    }
-
-                    Name name;
-                    int value;
-                    {
-                        long cursor = offset+size - 1L;
-                        {
-                            value = memorySegment.get(JAVA_BYTE, cursor) - '0';
-                            value += (memorySegment.get(JAVA_BYTE, cursor-2L) - '0') * 10;
-                            cursor -= 3L;
-                            if (memorySegment.get(JAVA_BYTE, cursor) == '-') {
-                                value *= -1;
-                                cursor -= 1L;
-                            } else if (memorySegment.get(JAVA_BYTE, cursor) != ';') {
-                                value += (memorySegment.get(JAVA_BYTE, cursor) - '0') * 100;
-                                cursor -= 1L;
-                                if (memorySegment.get(JAVA_BYTE, cursor) == '-') {
-                                    value *= -1;
-                                    cursor -= 1L;
-                                }
-                            }
-                        }
-                        //var data = memorySegment.asSlice(offset, cursor-offset).toArray(JAVA_BYTE);
-                        //System.arraycopy(chunk, 0, data, 0, data.length);
-                        //assert ';' != data[data.length - 1];
-                        //name = new Name(data);
-                        {
-                            int mod4StringSize = ((int)(cursor-offset+3))/4 * 4;
-                            var data = memorySegment.asSlice(offset, mod4StringSize).toArray(JAVA_INT_UNALIGNED);
-                            switch(((int)(cursor - offset)) % 4) {
-                                case 0: break;
-                                case 1: {
-                                    data[data.length - 1] &= 255;
-                                } break;
-                                case 2: {
-                                    data[data.length - 1] &= 65535;
-                                } break;
-                                case 3: {
-                                    data[data.length - 1] &= 16777215;
-                                } break;
-                            }
-                            name = new Name(data);
-                        }
-                    }
-                    offset += size + 1;
-                    return new Line(name, value);
                 }
             }
 
@@ -406,7 +423,7 @@ public class CalculateAverage_Judekeyser {
             }
             var joiner = new StringJoiner(", ", "{", "}");
             for (var entry : sortedMap.entrySet()) {
-                joiner.add(STR. "\{ entry.getKey() }=\{ entry.getValue() }" );
+                joiner.add("%s=%s".formatted(entry.getKey(), entry.getValue()) );
             }
             System.out.println(joiner);
         }

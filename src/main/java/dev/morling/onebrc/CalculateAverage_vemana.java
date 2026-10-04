@@ -222,12 +222,12 @@ public class CalculateAverage_vemana {
             }
         }
 
-        // System.err.println(STR."""
+        // System.err.println("""
         // Using the following parameters:
-        // - chunkSizeBits = \{chunkSizeBits}
-        // - commonChunkFraction = \{commonChunkFraction}
-        // - commonChunkSizeBits = \{commonChunkSizeBits}
-        // - hashtableSizeBits = \{hashtableSizeBits}
+        // - chunkSizeBits = {chunkSizeBits}
+        // - commonChunkFraction = {commonChunkFraction}
+        // - commonChunkSizeBits = {commonChunkSizeBits}
+        // - hashtableSizeBits = {hashtableSizeBits}
         // """);
 
         System.out.println(
@@ -343,17 +343,17 @@ public class CalculateAverage_vemana {
             endInBuf = (int) (rangeEnd - bufferStart);
         }
 
-    @Override
-    public String toString() {
-      return STR."""
-        ByteRange {
-          bufferStart = \{bufferStart}
-          bufferEnd = \{bufferEnd}
-          startInBuf = \{startInBuf}
-          endInBuf = \{endInBuf}
+        @Override
+        public String toString() {
+            return """
+                    ByteRange {
+                      bufferStart = {bufferStart}
+                      bufferEnd = {bufferEnd}
+                      startInBuf = {startInBuf}
+                      endInBuf = {endInBuf}
+                    }
+                    """;
         }
-        """;
-    }
 
         private void close(MappedByteBuffer buffer) {
             Method cleanerMethod = Reflection.findMethodNamed(buffer, "cleaner");
@@ -1054,9 +1054,9 @@ public class CalculateAverage_vemana {
             System.err.println(message);
         }
 
-    private static void printEvent(String message, long nanoTime) {
-      errPrint(STR."\{message} = \{(nanoTime - startTime) / 1_000_000}ms");
-    }
+        private static void printEvent(String message, long nanoTime) {
+            errPrint("%s = {(nanoTime - startTime) / 1_000_000}ms".formatted(message));
+        }
 
         public static class ThreadTimingsArray {
 
@@ -1076,50 +1076,50 @@ public class CalculateAverage_vemana {
                 this.id = id;
             }
 
-      public String analyze(int nThreads) {
-        if (!hasData) {
-          return "%s has no thread timings data".formatted(id);
-        }
-        Checks.checkArg(nThreads <= timestamps.length);
-        long minDuration = Long.MAX_VALUE, maxDuration = Long.MIN_VALUE;
-        long minBegin = Long.MAX_VALUE, maxCompletion = Long.MIN_VALUE;
-        long maxBegin = Long.MIN_VALUE, minCompletion = Long.MAX_VALUE;
+            public String analyze(int nThreads) {
+                if (!hasData) {
+                    return "%s has no thread timings data".formatted(id);
+                }
+                Checks.checkArg(nThreads <= timestamps.length);
+                long minDuration = Long.MAX_VALUE, maxDuration = Long.MIN_VALUE;
+                long minBegin = Long.MAX_VALUE, maxCompletion = Long.MIN_VALUE;
+                long maxBegin = Long.MIN_VALUE, minCompletion = Long.MAX_VALUE;
 
-        long[] durationsMs = new long[nThreads];
-        long[] completionsMs = new long[nThreads];
-        long[] beginMs = new long[nThreads];
-        for (int i = 0; i < nThreads; i++) {
-          long durationNs = timestamps[2 * i + 1] - timestamps[2 * i];
-          durationsMs[i] = durationNs / 1_000_000;
-          completionsMs[i] = (timestamps[2 * i + 1] - startTime) / 1_000_000;
-          beginMs[i] = (timestamps[2 * i] - startTime) / 1_000_000;
+                long[] durationsMs = new long[nThreads];
+                long[] completionsMs = new long[nThreads];
+                long[] beginMs = new long[nThreads];
+                for (int i = 0; i < nThreads; i++) {
+                    long durationNs = timestamps[2 * i + 1] - timestamps[2 * i];
+                    durationsMs[i] = durationNs / 1_000_000;
+                    completionsMs[i] = (timestamps[2 * i + 1] - startTime) / 1_000_000;
+                    beginMs[i] = (timestamps[2 * i] - startTime) / 1_000_000;
 
-          minDuration = Math.min(minDuration, durationNs);
-          maxDuration = Math.max(maxDuration, durationNs);
+                    minDuration = Math.min(minDuration, durationNs);
+                    maxDuration = Math.max(maxDuration, durationNs);
 
-          minBegin = Math.min(minBegin, timestamps[2 * i] - startTime);
-          maxBegin = Math.max(maxBegin, timestamps[2 * i] - startTime);
+                    minBegin = Math.min(minBegin, timestamps[2 * i] - startTime);
+                    maxBegin = Math.max(maxBegin, timestamps[2 * i] - startTime);
 
-          maxCompletion = Math.max(maxCompletion, timestamps[2 * i + 1] - startTime);
-          minCompletion = Math.min(minCompletion, timestamps[2 * i + 1] - startTime);
-        }
-        return STR."""
-        -------------------------------------------------------------------------------------------
-                                       \{id} Stats
-        -------------------------------------------------------------------------------------------
-        Max duration                              = \{maxDuration / 1_000_000} ms
-        Min duration                              = \{minDuration / 1_000_000} ms
-        Timespan[max(end)-min(start)]             = \{(maxCompletion - minBegin) / 1_000_000} ms [\{maxCompletion / 1_000_000} - \{minBegin / 1_000_000} ]
-        Completion Timespan[max(end)-min(end)]    = \{(maxCompletion - minCompletion) / 1_000_000} ms
-        Begin Timespan[max(begin)-min(begin)]     = \{(maxBegin - minBegin) / 1_000_000} ms
-        Average Duration                          = \{Arrays.stream(durationsMs)
-                                                            .average()
-                                                            .getAsDouble()} ms
-        Durations                                 = \{toString(durationsMs)} ms
-        Begin Timestamps                          = \{toString(beginMs)} ms
-        Completion Timestamps                     = \{toString(completionsMs)} ms
-        """;
-      }
+                    maxCompletion = Math.max(maxCompletion, timestamps[2 * i + 1] - startTime);
+                    minCompletion = Math.min(minCompletion, timestamps[2 * i + 1] - startTime);
+                }
+                return """
+                        -------------------------------------------------------------------------------------------
+                                                       {id} Stats
+                        -------------------------------------------------------------------------------------------
+                        Max duration                              = {maxDuration / 1_000_000} ms
+                        Min duration                              = {minDuration / 1_000_000} ms
+                        Timespan[max(end)-min(start)]             = {(maxCompletion - minBegin) / 1_000_000} ms [{maxCompletion / 1_000_000} - {minBegin / 1_000_000} ]
+                        Completion Timespan[max(end)-min(end)]    = {(maxCompletion - minCompletion) / 1_000_000} ms
+                        Begin Timespan[max(begin)-min(begin)]     = {(maxBegin - minBegin) / 1_000_000} ms
+                        Average Duration                          = {Arrays.stream(durationsMs)
+                                                                            .average()
+                                                                            .getAsDouble()} ms
+                        Durations                                 = {toString(durationsMs)} ms
+                        Begin Timestamps                          = {toString(beginMs)} ms
+                        Completion Timestamps                     = {toString(completionsMs)} ms
+                        """;
+            }
 
             public void recordEnd(int idx) {
                 timestamps[2 * idx + 1] = System.nanoTime();

@@ -67,16 +67,15 @@ public class CalculateAverage_moysesb {
         File f = new File(FILE);
         long fileSize = f.length();
         long split = 0;
-        long chunkSize = Math.min(1 << 28,  fileSize < 1 << 28 ? fileSize : (fileSize / ncpus));
+        long chunkSize = Math.min(1 << 28, fileSize < 1 << 28 ? fileSize : (fileSize / ncpus));
         List<Future<Map<ByteArray, double[]>>> tasks = new ArrayList<>();
 
         while (split < fileSize) {
-            final long[] offset = {split};
+            final long[] offset = { split };
             var task = exec.submit(() -> {
                 try {
                     final Map<ByteArray, double[]> results = new HashMap<>(512);
-                    file:
-                    for (; ; ) {
+                    file: for (;;) {
                         long chunk = Math.min(fileSize - offset[0], chunkSize);
                         if (chunk == 0) {
                             return results;
@@ -99,58 +98,64 @@ public class CalculateAverage_moysesb {
                                 int dotOffset = 0;
                                 int l = 0;
                                 int nameHash = 0;
-                                for (; ; ) {
+                                for (;;) {
                                     byte b = mm.get(ValueLayout.OfByte.JAVA_BYTE, i++);
                                     if (b == ';') {
                                         target = valb;
                                         l = 0;
-                                    } else if (b == '\n') {
+                                    }
+                                    else if (b == '\n') {
                                         int integral = 0;
                                         int mult = 1;
                                         int frac = 0;
                                         for (int ii = 0; ii < dotOffset; ii++) {
                                             if (valb[ii] == '-') {
                                                 mult = -1;
-                                            } else {
+                                            }
+                                            else {
                                                 integral = integral * 10 + (valb[ii] - '0');
                                             }
                                         }
 
-                                        for (int ii = dotOffset+1; ii < l; ii++) {
+                                        for (int ii = dotOffset + 1; ii < l; ii++) {
                                             frac = frac * 10 + (valb[ii] - '0');
                                         }
                                         val = integral;
                                         if (frac > 0)
-                                            val += (frac/10d);
+                                            val += (frac / 10d);
 
                                         val *= mult;
                                         var ba = new ByteArray(city, nameHash);
 
-                                        var r = results.computeIfAbsent(ba, _s -> new double[]{1000, -1000, 0, 0});
+                                        var r = results.computeIfAbsent(ba, _s -> new double[]{ 1000, -1000, 0, 0 });
                                         r[0] = Math.min(r[0], val);
                                         r[1] = Math.max(r[1], val);
                                         r[2]++;
                                         r[3] += val;
                                         break;
-                                    } else {
+                                    }
+                                    else {
                                         if (target == city) {
                                             nameHash = nameHash * 31 + b;
-                                        } else if (b == '.') {
+                                        }
+                                        else if (b == '.') {
                                             dotOffset = l;
                                         }
                                         target[l++] = b;
 
                                     }
                                 }
-                            } catch (BufferUnderflowException | IndexOutOfBoundsException e) {
-                                //happens on the last segment after EOF
+                            }
+                            catch (BufferUnderflowException | IndexOutOfBoundsException e) {
+                                // happens on the last segment after EOF
                                 break file;
                             }
                         }
                         offset[0] += i;
                     }
                     return results;
-                } catch (IOException e) {
+                }
+                catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             });
@@ -183,10 +188,11 @@ public class CalculateAverage_moysesb {
         for (Map.Entry<ByteArray, double[]> e : allResults.entrySet()) {
             byte[] utf8 = e.getKey().value;
             int strlen = 0;
-            while (utf8[strlen] != '\0') strlen++;
-            String city = new String(utf8, 0,  strlen, StandardCharsets.UTF_8);
+            while (utf8[strlen] != '\0')
+                strlen++;
+            String city = new String(utf8, 0, strlen, StandardCharsets.UTF_8);
             double[] r = e.getValue();
-            String fmt = FormatProcessor.FMT."%.1f\{round(r[0])}/%.1f\{round(r[3]/r[2])}/%.1f\{round(r[1])}";
+            String fmt = String.format("%.1f/%.1f/%.1f", round(r[0]), round(r[3] / r[2]), round(r[1]));
             sorted.put(city, fmt);
         }
 

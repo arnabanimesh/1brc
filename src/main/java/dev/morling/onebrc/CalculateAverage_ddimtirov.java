@@ -45,7 +45,7 @@ public class CalculateAverage_ddimtirov {
 
     @SuppressWarnings("RedundantSuppression")
     public static void main(String[] args) throws IOException, InterruptedException {
-        var path = Path.of(args.length>0 ? args[0] : FILE);
+        var path = Path.of(args.length > 0 ? args[0] : FILE);
         Instant start = null;// Instant.now();
 
         var desiredSegmentsCount = Runtime.getRuntime().availableProcessors();
@@ -56,7 +56,7 @@ public class CalculateAverage_ddimtirov {
         var threads = fileSegments.stream().map(fileSegment -> Thread // manually start thread per segment
                 .ofPlatform()
                 .group(loaders)
-                .name(STR."Segment \{fileSegment}")
+                .name("Segment %s".formatted(fileSegment))
                 .start(() -> {
                     try (var fileChannel = (FileChannel) Files.newByteChannel(path, StandardOpenOption.READ)) {
                         var tracker = new Tracker();
@@ -67,10 +67,10 @@ public class CalculateAverage_ddimtirov {
                     catch (IOException e) {
                         throw new RuntimeException(e);
                     }
-                })
-        ).toList();
+                })).toList();
 
-        for (Thread thread : threads) thread.join();
+        for (Thread thread : threads)
+            thread.join();
         assert trackers.size() == threads.size();
         assert trackers.size() <= desiredSegmentsCount;
 
@@ -80,7 +80,8 @@ public class CalculateAverage_ddimtirov {
         // noinspection ConstantValue
         if (start != null) {
             System.err.println(Duration.between(start, Instant.now()));
-            if (assertions) System.err.printf("hash clashes: %s%n", hashCollisionOccurrences);
+            if (assertions)
+                System.err.printf("hash clashes: %s%n", hashCollisionOccurrences);
         }
         assert Files.readAllLines(Path.of("measurements.out")).getFirst().equals(result);
     }
@@ -88,7 +89,7 @@ public class CalculateAverage_ddimtirov {
     record FileSegment(int index, long start, long size) {
         @Override
         public String toString() {
-            return STR."#\{index} [\{start}..\{start + size}] \{size} bytes";
+            return "#%s [{start}..{start + size}] {size} bytes".formatted(index);
         }
 
         public static List<FileSegment> forFile(Path file, int desiredSegmentsCount) throws IOException {
@@ -247,11 +248,11 @@ public class CalculateAverage_ddimtirov {
                     byte[] trimmedBytes = Arrays.copyOf(nameBytesBuffer, nameLength);
                     names[i] = new String(trimmedBytes, StandardCharsets.UTF_8);
                     nameBytes[i] = trimmedBytes;
-                    minMaxCount[i*3 + OFFSET_MIN] = Integer.MAX_VALUE;
-                    minMaxCount[i*3 + OFFSET_MAX] = Integer.MIN_VALUE;
+                    minMaxCount[i * 3 + OFFSET_MIN] = Integer.MAX_VALUE;
+                    minMaxCount[i * 3 + OFFSET_MAX] = Integer.MIN_VALUE;
                     break;
                 }
-                else if (nameBytes[i].length==nameLength && Arrays.equals(nameBytes[i], 0, nameLength, nameBytesBuffer, 0, nameLength)) {
+                else if (nameBytes[i].length == nameLength && Arrays.equals(nameBytes[i], 0, nameLength, nameBytesBuffer, 0, nameLength)) {
                     break;
                 }
                 if (assertions) {
@@ -263,7 +264,7 @@ public class CalculateAverage_ddimtirov {
             if (assertions) {
                 var key = new String(nameBytesBuffer, 0, nameLength, StandardCharsets.UTF_8);
                 if (hashCollisionOccurrences.containsKey(key)) {
-                    hashCollisionOccurrences.computeIfAbsent(STR."\{key}[\{i}]", _ -> new LongAdder()).increment();
+                    hashCollisionOccurrences.computeIfAbsent("%s[{i}]".formatted(key), _ -> new LongAdder()).increment();
                 }
             }
 

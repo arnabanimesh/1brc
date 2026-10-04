@@ -79,7 +79,7 @@ public class CalculateAverage_ricardopieper {
             var avg = String.format("%.1f", ((double) this.sum / (double) this.count) / 10.0);
             var max = String.format("%.1f", (double) this.max / 10.0);
 
-            return STR."\{min}/\{avg}/\{max}";
+            return "%s/{avg}/{max}".formatted(min);
         }
     }
 
@@ -319,7 +319,7 @@ public class CalculateAverage_ricardopieper {
             measurements.sum += temp;
             measurements.count += 1;
 
-            // System.out.println(STR."\{name} -> \{tempStr}");
+            // System.out.println("%s -> {tempStr}".formatted(name));
 
             nameStart = tempEnd + 1;
             nameEnd = nameStart;

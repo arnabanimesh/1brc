@@ -236,9 +236,10 @@ public class CalculateAverage_adriacabeza {
             // Print the measurements result to the console.
             System.out.println(measurements);
 
-        } catch (IOException e) {
+        }
+        catch (IOException e) {
             // Handle any potential I/O exceptions by printing the error message to the console
-            System.err.println(STR."Error processing file: \{e.getMessage()}");
+            System.err.println("Error processing file: %s".formatted(e.getMessage()));
         }
     }
 }

@@ -563,7 +563,7 @@ public class CalculateAverage_vaidhy<I, T> {
         for (Map.Entry<String, IntSummaryStatistics> entry : output.entrySet()) {
             IntSummaryStatistics stat = entry.getValue();
             outputStr.put(entry.getKey(),
-                    STR."\{stat.getMin() / 10.0}/\{Math.round(stat.getAverage()) / 10.0}/\{stat.getMax() / 10.0}");
+                    "%s/{Math.round(stat.getAverage()) / 10.0}/{stat.getMax() / 10.0}".formatted(stat.getMin() / 10.0));
         }
         return outputStr;
     }

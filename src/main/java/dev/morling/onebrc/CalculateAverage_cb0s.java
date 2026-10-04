@@ -41,7 +41,7 @@ public class CalculateAverage_cb0s {
         }
         var stopTime = System.currentTimeMillis();
 
-        System.out.println(STR."Running 3 times took: \{stopTime - startTime}ms (1 run: \{(stopTime - startTime) / 3}ms)");
+        System.out.println("Running 3 times took: %sms (1 run: {(stopTime - startTime) / 3}ms)".formatted(stopTime - startTime));
     }
 
     private static void run() throws IOException {
@@ -105,7 +105,7 @@ public class CalculateAverage_cb0s {
 
     @Override
     public String toString() {
-        return STR."\{rawName}=\{results.min/10.0}/\{Math.round(results.sum / (float) results.count) / 10.0}/\{results.max/10.0}";
+        return "%s={results.min/10.0}/{Math.round(results.sum / (float) results.count) / 10.0}/{results.max/10.0}".formatted(rawName);
     }
 
     @Override

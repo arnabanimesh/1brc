@@ -54,97 +54,97 @@ import sun.misc.Unsafe;
  */
 public class CalculateAverage_vemanaNonIdiomatic {
 
-  public static void main(String[] args) throws Exception {
-    String className = MethodHandles.lookup().lookupClass().getSimpleName();
-    System.err.println(
-        STR."""
-        ------------------------------------------------
-        Running \{className}
-        -------------------------------------------------
-        """);
-    Tracing.recordAppStart();
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () -> {
-                  Tracing.recordEvent("In Shutdown hook");
-                }));
+    public static void main(String[] args) throws Exception {
+        String className = MethodHandles.lookup().lookupClass().getSimpleName();
+        System.err.println(
+                """
+                        ------------------------------------------------
+                        Running {className}
+                        -------------------------------------------------
+                        """);
+        Tracing.recordAppStart();
+        Runtime.getRuntime()
+                .addShutdownHook(
+                        new Thread(
+                                () -> {
+                                    Tracing.recordEvent("In Shutdown hook");
+                                }));
 
-    // First process in large chunks without coordination among threads
-    // Use chunkSizeBits for the large-chunk size
-    int chunkSizeBits = 20;
+        // First process in large chunks without coordination among threads
+        // Use chunkSizeBits for the large-chunk size
+        int chunkSizeBits = 20;
 
-    // For the last commonChunkFraction fraction of total work, use smaller chunk sizes
-    double commonChunkFraction = 0.03;
+        // For the last commonChunkFraction fraction of total work, use smaller chunk sizes
+        double commonChunkFraction = 0.03;
 
-    // Use commonChunkSizeBits for the small-chunk size
-    int commonChunkSizeBits = 18;
+        // Use commonChunkSizeBits for the small-chunk size
+        int commonChunkSizeBits = 18;
 
-    // Size of the hashtable (attempt to fit in L2 of 512KB of eval machine)
-    int hashtableSizeBits = className.toLowerCase().contains("nonidiomatic") ? 13 : 16;
+        // Size of the hashtable (attempt to fit in L2 of 512KB of eval machine)
+        int hashtableSizeBits = className.toLowerCase().contains("nonidiomatic") ? 13 : 16;
 
-    // Reserve some number of lines at the end to give us freedom in reading LONGs past ranges
-    int minReservedBytesAtFileTail = 9;
+        // Reserve some number of lines at the end to give us freedom in reading LONGs past ranges
+        int minReservedBytesAtFileTail = 9;
 
-    // Number of threads
-    int nThreads = -1;
+        // Number of threads
+        int nThreads = -1;
 
-    String inputFile = "measurements.txt";
+        String inputFile = "measurements.txt";
 
-    // Parallelize unmap. Thread #n (n=1,2,..N) unmaps its bytebuffer when
-    // munmapFraction * n work remains.
-    double munmapFraction = 0.03;
+        // Parallelize unmap. Thread #n (n=1,2,..N) unmaps its bytebuffer when
+        // munmapFraction * n work remains.
+        double munmapFraction = 0.03;
 
-    boolean fakeAdvance = false;
+        boolean fakeAdvance = false;
 
-    for (String arg : args) {
-      String key = arg.substring(0, arg.indexOf('=')).trim();
-      String value = arg.substring(key.length() + 1).trim();
-      switch (key) {
-        case "chunkSizeBits":
-          chunkSizeBits = Integer.parseInt(value);
-          break;
-        case "commonChunkFraction":
-          commonChunkFraction = Double.parseDouble(value);
-          break;
-        case "commonChunkSizeBits":
-          commonChunkSizeBits = Integer.parseInt(value);
-          break;
-        case "hashtableSizeBits":
-          hashtableSizeBits = Integer.parseInt(value);
-          break;
-        case "inputFile":
-          inputFile = value;
-          break;
-        case "munmapFraction":
-          munmapFraction = Double.parseDouble(value);
-          break;
-        case "fakeAdvance":
-          fakeAdvance = Boolean.parseBoolean(value);
-          break;
-        case "nThreads":
-          nThreads = Integer.parseInt(value);
-          break;
-        default:
-          throw new IllegalArgumentException("Unknown argument: " + arg);
-      }
+        for (String arg : args) {
+            String key = arg.substring(0, arg.indexOf('=')).trim();
+            String value = arg.substring(key.length() + 1).trim();
+            switch (key) {
+                case "chunkSizeBits":
+                    chunkSizeBits = Integer.parseInt(value);
+                    break;
+                case "commonChunkFraction":
+                    commonChunkFraction = Double.parseDouble(value);
+                    break;
+                case "commonChunkSizeBits":
+                    commonChunkSizeBits = Integer.parseInt(value);
+                    break;
+                case "hashtableSizeBits":
+                    hashtableSizeBits = Integer.parseInt(value);
+                    break;
+                case "inputFile":
+                    inputFile = value;
+                    break;
+                case "munmapFraction":
+                    munmapFraction = Double.parseDouble(value);
+                    break;
+                case "fakeAdvance":
+                    fakeAdvance = Boolean.parseBoolean(value);
+                    break;
+                case "nThreads":
+                    nThreads = Integer.parseInt(value);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown argument: " + arg);
+            }
+        }
+
+        System.out.println(
+                new Runner(
+                        Path.of(inputFile),
+                        nThreads,
+                        chunkSizeBits,
+                        commonChunkFraction,
+                        commonChunkSizeBits,
+                        hashtableSizeBits,
+                        minReservedBytesAtFileTail,
+                        munmapFraction,
+                        fakeAdvance)
+                                .getSummaryStatistics());
+
+        Tracing.recordEvent("Final result printed");
     }
-
-    System.out.println(
-        new Runner(
-                Path.of(inputFile),
-                nThreads,
-                chunkSizeBits,
-                commonChunkFraction,
-                commonChunkSizeBits,
-                hashtableSizeBits,
-                minReservedBytesAtFileTail,
-                munmapFraction,
-                fakeAdvance)
-            .getSummaryStatistics());
-
-    Tracing.recordEvent("Final result printed");
-  }
 
   public record AggregateResult(Map<String, Stat> tempStats) {
 
@@ -248,20 +248,20 @@ public class CalculateAverage_vemanaNonIdiomatic {
             endAddress = bufferBaseAddr + endInBuf;
         }
 
-    @Override
-    public String toString() {
-      return STR."""
-        ByteRange {
-          shard                 = \{shardIdx}
-          extentStart           = \{extentStart}
-          extentEnd             = \{extentEnd}
-          startInBuf            = \{startInBuf}
-          endInBuf              = \{endInBuf}
-          startAddress          = \{startAddress}
-          endAddress            = \{endAddress}
+        @Override
+        public String toString() {
+            return """
+                    ByteRange {
+                      shard                 = {shardIdx}
+                      extentStart           = {extentStart}
+                      extentEnd             = {extentEnd}
+                      startInBuf            = {startInBuf}
+                      endInBuf              = {endInBuf}
+                      startAddress          = {startAddress}
+                      endAddress            = {endAddress}
+                    }
+                    """;
         }
-        """;
-    }
 
         private void bufferCleanSlate() {
             if (byteBuffer != null) {
@@ -497,14 +497,14 @@ public class CalculateAverage_vemanaNonIdiomatic {
             return Unsafely.readInt(baseAddress + OFFSET_SUM);
         }
 
-    public String toString() {
-      return STR."""
-        min = \{min()}
-        max = \{max()}
-        count = \{count()}
-        sum = \{sum()}
-        """;
-    }
+        public String toString() {
+            return """
+                    min = {min()}
+                    max = {max()}
+                    count = {count()}
+                    sum = {sum()}
+                    """;
+        }
 
         public void update(short temperature) {
             setMin((short) Math.min(min(), temperature));
@@ -657,21 +657,21 @@ public class CalculateAverage_vemanaNonIdiomatic {
             }
         }
 
-    public AggregateResult result() {
-      Map<String, Stat> map = new LinkedHashMap<>(5_000);
-      for (int i = 0; i < entryMeta.nEntries(); i++) {
-        entry.setIndex(i);
-        if (entry.isPresent()) {
-          map.put(entry.cityNameString(), entry.stat());
+        public AggregateResult result() {
+            Map<String, Stat> map = new LinkedHashMap<>(5_000);
+            for (int i = 0; i < entryMeta.nEntries(); i++) {
+                entry.setIndex(i);
+                if (entry.isPresent()) {
+                    map.put(entry.cityNameString(), entry.stat());
+                }
+            }
+            System.err.println(
+                    """
+                            HashHits = {hashHits}
+                            HashMisses = {hashMisses} ({hashMisses * 100.0 / hashHits})
+                            """);
+            return new AggregateResult(map);
         }
-      }
-      System.err.println(
-          STR."""
-        HashHits = \{hashHits}
-        HashMisses = \{hashMisses} (\{hashMisses * 100.0 / hashHits})
-        """);
-      return new AggregateResult(map);
-    }
 
         private EntryData getNewEntry(EntryData oldEntry, EntryMeta newEntryMeta) {
             EntryData newEntry = new EntryData(newEntryMeta);
@@ -1476,9 +1476,9 @@ public class CalculateAverage_vemanaNonIdiomatic {
             System.err.println(message);
         }
 
-    private static void printEvent(String message, long nanoTime) {
-      errPrint(STR."\{message} = \{(nanoTime - startTime) / 1_000_000}ms");
-    }
+        private static void printEvent(String message, long nanoTime) {
+            errPrint("%s = {(nanoTime - startTime) / 1_000_000}ms".formatted(message));
+        }
 
         public static class ThreadTimingsArray {
 
@@ -1498,50 +1498,50 @@ public class CalculateAverage_vemanaNonIdiomatic {
                 this.id = id;
             }
 
-      public String analyze(int nThreads) {
-        if (!hasData) {
-          return "%s has no thread timings data".formatted(id);
-        }
-        Checks.checkArg(nThreads <= timestamps.length);
-        long minDuration = Long.MAX_VALUE, maxDuration = Long.MIN_VALUE;
-        long minBegin = Long.MAX_VALUE, maxCompletion = Long.MIN_VALUE;
-        long maxBegin = Long.MIN_VALUE, minCompletion = Long.MAX_VALUE;
+            public String analyze(int nThreads) {
+                if (!hasData) {
+                    return "%s has no thread timings data".formatted(id);
+                }
+                Checks.checkArg(nThreads <= timestamps.length);
+                long minDuration = Long.MAX_VALUE, maxDuration = Long.MIN_VALUE;
+                long minBegin = Long.MAX_VALUE, maxCompletion = Long.MIN_VALUE;
+                long maxBegin = Long.MIN_VALUE, minCompletion = Long.MAX_VALUE;
 
-        long[] durationsMs = new long[nThreads];
-        long[] completionsMs = new long[nThreads];
-        long[] beginMs = new long[nThreads];
-        for (int i = 0; i < nThreads; i++) {
-          long durationNs = timestamps[2 * i + 1] - timestamps[2 * i];
-          durationsMs[i] = durationNs / 1_000_000;
-          completionsMs[i] = (timestamps[2 * i + 1] - startTime) / 1_000_000;
-          beginMs[i] = (timestamps[2 * i] - startTime) / 1_000_000;
+                long[] durationsMs = new long[nThreads];
+                long[] completionsMs = new long[nThreads];
+                long[] beginMs = new long[nThreads];
+                for (int i = 0; i < nThreads; i++) {
+                    long durationNs = timestamps[2 * i + 1] - timestamps[2 * i];
+                    durationsMs[i] = durationNs / 1_000_000;
+                    completionsMs[i] = (timestamps[2 * i + 1] - startTime) / 1_000_000;
+                    beginMs[i] = (timestamps[2 * i] - startTime) / 1_000_000;
 
-          minDuration = Math.min(minDuration, durationNs);
-          maxDuration = Math.max(maxDuration, durationNs);
+                    minDuration = Math.min(minDuration, durationNs);
+                    maxDuration = Math.max(maxDuration, durationNs);
 
-          minBegin = Math.min(minBegin, timestamps[2 * i] - startTime);
-          maxBegin = Math.max(maxBegin, timestamps[2 * i] - startTime);
+                    minBegin = Math.min(minBegin, timestamps[2 * i] - startTime);
+                    maxBegin = Math.max(maxBegin, timestamps[2 * i] - startTime);
 
-          maxCompletion = Math.max(maxCompletion, timestamps[2 * i + 1] - startTime);
-          minCompletion = Math.min(minCompletion, timestamps[2 * i + 1] - startTime);
-        }
-        return STR."""
-        -------------------------------------------------------------------------------------------
-                                       \{id} Stats
-        -------------------------------------------------------------------------------------------
-        Max duration                              = \{maxDuration / 1_000_000} ms
-        Min duration                              = \{minDuration / 1_000_000} ms
-        Timespan[max(end)-min(start)]             = \{(maxCompletion - minBegin) / 1_000_000} ms [\{maxCompletion / 1_000_000} - \{minBegin / 1_000_000} ]
-        Completion Timespan[max(end)-min(end)]    = \{(maxCompletion - minCompletion) / 1_000_000} ms
-        Begin Timespan[max(begin)-min(begin)]     = \{(maxBegin - minBegin) / 1_000_000} ms
-        Average Duration                          = \{Arrays.stream(durationsMs)
-                                                            .average()
-                                                            .getAsDouble()} ms
-        Durations                                 = \{toString(durationsMs)} ms
-        Begin Timestamps                          = \{toString(beginMs)} ms
-        Completion Timestamps                     = \{toString(completionsMs)} ms
-        """;
-      }
+                    maxCompletion = Math.max(maxCompletion, timestamps[2 * i + 1] - startTime);
+                    minCompletion = Math.min(minCompletion, timestamps[2 * i + 1] - startTime);
+                }
+                return """
+                        -------------------------------------------------------------------------------------------
+                                                       {id} Stats
+                        -------------------------------------------------------------------------------------------
+                        Max duration                              = {maxDuration / 1_000_000} ms
+                        Min duration                              = {minDuration / 1_000_000} ms
+                        Timespan[max(end)-min(start)]             = {(maxCompletion - minBegin) / 1_000_000} ms [{maxCompletion / 1_000_000} - {minBegin / 1_000_000} ]
+                        Completion Timespan[max(end)-min(end)]    = {(maxCompletion - minCompletion) / 1_000_000} ms
+                        Begin Timespan[max(begin)-min(begin)]     = {(maxBegin - minBegin) / 1_000_000} ms
+                        Average Duration                          = {Arrays.stream(durationsMs)
+                                                                            .average()
+                                                                            .getAsDouble()} ms
+                        Durations                                 = {toString(durationsMs)} ms
+                        Begin Timestamps                          = {toString(beginMs)} ms
+                        Completion Timestamps                     = {toString(completionsMs)} ms
+                        """;
+            }
 
             public void recordEnd(int idx) {
                 timestamps[2 * idx + 1] = System.nanoTime();

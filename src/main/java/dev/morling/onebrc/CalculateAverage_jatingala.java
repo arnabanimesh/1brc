@@ -148,7 +148,7 @@ public class CalculateAverage_jatingala {
 
         @Override
         public String toString() {
-            return STR."\{round(min)}/\{round(sum / count)}/\{round(max)}";
+            return "%s/{round(sum / count)}/{round(max)}".formatted(round(min));
         }
     }
 }

@@ -75,14 +75,13 @@ public class CalculateAverage_padreati {
         File file = new File(FILE);
         var splits = findFileSplits();
         List<StructuredTaskScope.Subtask<Map<String, MeasurementAggregator>>> subtasks = new ArrayList<>();
-        try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+        try (var scope = StructuredTaskScope.open()) {
             for (int i = 0; i < splits.size(); i++) {
                 long splitStart = splits.get(i);
                 long splitEnd = i < splits.size() - 1 ? splits.get(i + 1) : file.length() + 1;
                 subtasks.add(scope.fork(() -> chunkProcessor(file, splitStart, splitEnd)));
             }
             scope.join();
-            scope.throwIfFailed();
 
             var resultList = subtasks.stream().map(StructuredTaskScope.Subtask::get).toList();
             TreeMap<String, ResultRow> measurements = collapseResults(resultList);

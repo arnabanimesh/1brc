@@ -89,7 +89,7 @@ public class CalculateAverage_MahmoudFawzyKhalil {
             String temperature = readString(ms, start, temperatureSize);
             start = start + temperatureSize + 1;
 
-            // System.out.println(STR."\{cityName};\{temperature}");
+            // System.out.println("%s;{temperature}".formatted(cityName));
             addMeasurement(map, cityName, temperature);
         }
 

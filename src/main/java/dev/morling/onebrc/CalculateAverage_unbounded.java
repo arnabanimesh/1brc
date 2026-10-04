@@ -93,7 +93,7 @@ public class CalculateAverage_unbounded {
 
         @Override
         public String toString() {
-            return STR."\{min/10.0}/\{Math.round(1.0 * totalTemp / count)/10.0}/\{max/10.0}";
+            return "%s/{Math.round(1.0 * totalTemp / count)/10.0}/{max/10.0}".formatted(min / 10.0);
         }
     }
 
@@ -206,12 +206,14 @@ public class CalculateAverage_unbounded {
                     int endMargin = 64;
                     try (var arena = Arena.ofConfined()) {
                         var mem = channel.map(FileChannel.MapMode.READ_ONLY, segment.start - startMargin, segment.len + endMargin + startMargin, arena);
-                        processChunk(mem, startMargin, segment.len + startMargin, hashTable, nameTable, stationIndexes, minMax, accumulators, nextNamePos, nextStationIndex);
+                        processChunk(mem, startMargin, segment.len + startMargin, hashTable, nameTable, stationIndexes, minMax, accumulators, nextNamePos,
+                                nextStationIndex);
                     }
                 }
                 report.accept(decodeResult(hashTable, nameTable, stationIndexes, accumulators, minMax));
-            } catch (IOException e) {
-                System.err.println(STR."I/O Exception: \{e}");
+            }
+            catch (IOException e) {
+                System.err.println("I/O Exception: %s".formatted(e));
                 throw new RuntimeException(e);
             }
         }
@@ -425,13 +427,12 @@ public class CalculateAverage_unbounded {
     private static void printResult(Map<String, StationStat> stats) {
         System.out.print("{");
         System.out.print(
-            stats.keySet().stream().sorted()
-                    .map(key -> {
-                        var s = stats.get(key);
-                        return STR."\{key}=\{s}";
-                    })
-                    .collect(Collectors.joining(", "))
-        );
+                stats.keySet().stream().sorted()
+                        .map(key -> {
+                            var s = stats.get(key);
+                            return "%s={s}".formatted(key);
+                        })
+                        .collect(Collectors.joining(", ")));
         System.out.println("}");
     }
 }

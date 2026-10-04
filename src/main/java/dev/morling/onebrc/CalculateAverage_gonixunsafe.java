@@ -517,7 +517,7 @@ public class CalculateAverage_gonixunsafe {
                     var ms = arena.allocate(keySize + 8);
                     UNSAFE.copyMemory(entryAddr + HEADER_SIZE, ms.address(), keySize);
                     UNSAFE.copyMemory(entryAddr + 1, ms.address() + keySize, 7);
-                    this.key = ms.getUtf8String(0);
+                    this.key = ms.getString(0);
                 }
             }
 

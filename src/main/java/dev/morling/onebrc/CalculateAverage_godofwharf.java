@@ -59,7 +59,7 @@ public class CalculateAverage_godofwharf {
     private static final int MAX_STR_LEN = 108;
     private static final int DEFAULT_HASH_TBL_SIZE = 4096;
     private static final int DEFAULT_PAGE_SIZE = 8_388_608; // 8 MB
-    private static final int PAGE_SIZE = Integer.parseInt(System.getProperty("pageSize", STR."\{DEFAULT_PAGE_SIZE}"));
+    private static final int PAGE_SIZE = Integer.parseInt(System.getProperty("pageSize", "%s".formatted(DEFAULT_PAGE_SIZE)));
 
     public static void main(String[] args) throws Exception {
         long startTimeMs = System.currentTimeMillis();
@@ -74,7 +74,7 @@ public class CalculateAverage_godofwharf {
 
     private static Map<String, MeasurementAggregator> compute() throws Exception {
         int nThreads = Integer.parseInt(
-                System.getProperty("threads", STR."\{NCPU}"));
+                System.getProperty("threads", "%s".formatted(NCPU)));
         printDebugMessage("Running program with %d threads %n", nThreads);
         Job job = new Job(nThreads - 1);
         job.compute(FILE);
