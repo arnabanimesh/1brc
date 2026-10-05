@@ -20,10 +20,10 @@ if [ -f target/CalculateAverage_martin2038_image ]; then
     echo "Picking up existing native image 'target/CalculateAverage_martin2038_image', delete the file to select JVM mode." 1>&2
     target/CalculateAverage_martin2038_image
 else
-    
+
     #JAVA_OPTS="--enable-preview"
-    echo "Chosing to run the app in JVM mode as no native image was found, use prepare_martin2038.sh to generate." 1>&2 
-    # JAVA_OPTS="-XX:-EnableJVMCI -Xms16g -Xmx16g -XX:+AlwaysPreTouch -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC"
+    echo "Chosing to run the app in JVM mode as no native image was found, use prepare_martin2038.sh to generate." 1>&2
+    # JAVA_OPTS="-Xms16g -Xmx16g -XX:+AlwaysPreTouch -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC"
     JAVA_OPTS=""
     java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_martin2038
 
