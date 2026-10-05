@@ -22,9 +22,7 @@ JAVA_OPTS="$JAVA_OPTS -XX:-UseCountedLoopSafepoints -XX:LoopStripMiningIter=0 -X
 JAVA_OPTS="$JAVA_OPTS -XX:+TrustFinalNonStaticFields -da -dsa -XX:+UseNUMA -XX:-EnableJVMCI"
 JAVA_OPTS="$JAVA_OPTS -XX:SharedArchiveFile=target/CalculateAverage_serkan_ozal_cds.jsa"
 JAVA_OPTS="$JAVA_OPTS -Djdk.incubator.vector.VECTOR_ACCESS_OOB_CHECK=0"
-if [[ ! "$(uname -s)" = "Darwin" ]]; then
-  JAVA_OPTS="$JAVA_OPTS -XX:+UseTransparentHugePages"
-fi
+
 
 #echo "Process started at $(date +%s%N | cut -b1-13)"
 eval "exec 3< <({ java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_serkan_ozal; })"

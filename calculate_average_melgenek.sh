@@ -20,9 +20,6 @@ JAVA_OPTS="$JAVA_OPTS -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC -XX:+Al
 # These flags are mostly copied from the shipilev's branch. They don't really give a predictable benefit, but they don't hurt either.
 JAVA_OPTS="$JAVA_OPTS -XX:-TieredCompilation -XX:CICompilerCount=1 -XX:CompileThreshold=2048 -XX:-UseCountedLoopSafepoints -XX:+TrustFinalNonStaticFields"
 
-if [[ "$(uname -s)" == "Linux" ]]; then
-    JAVA_OPTS="$JAVA_OPTS -XX:+UseTransparentHugePages"
-fi
 
 # https://stackoverflow.com/a/23378780/7221823
 logicalCpuCount=$([ $(uname) = 'Darwin' ] &&

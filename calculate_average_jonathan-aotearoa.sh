@@ -20,8 +20,6 @@ if [ -f target/CalculateAverage_jonathan-aotearoa_image ]; then
     target/CalculateAverage_jonathan-aotearoa_image
 else
     JAVA_OPTS="--enable-preview -XX:+UnlockExperimentalVMOptions -XX:+TrustFinalNonStaticFields -dsa -XX:+UseNUMA"
-    JAVA_OPTS="$JAVA_OPTS -XX:+UseTransparentHugePages"
     echo "Running in JVM mode as no native image was found. Run 'prepare_jonathan-aotearoa.sh' to generate a native image." 1>&2
     java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_jonathanaotearoa
 fi
-

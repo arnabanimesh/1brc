@@ -19,7 +19,7 @@ if [ -f target/CalculateAverage_roman_r_m_image ]; then
     echo "Running native image 'target/CalculateAverage_roman_r_m_image'." 1>&2
     target/CalculateAverage_roman_r_m_image
 else
-    JAVA_OPTS="--enable-preview -XX:+UseTransparentHugePages"
+    JAVA_OPTS="--enable-preview"
     JAVA_OPTS="$JAVA_OPTS -XX:+UnlockExperimentalVMOptions -XX:+TrustFinalNonStaticFields -dsa -XX:+UseNUMA"
     # epsilon GC needs enough memory or it makes things worse
     # see https://stackoverflow.com/questions/58087596/why-are-repeated-memory-allocations-observed-to-be-slower-using-epsilon-vs-g1

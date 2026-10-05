@@ -25,9 +25,6 @@ JAVA_OPTS="$JAVA_OPTS -XX:-UseCountedLoopSafepoints -XX:GuaranteedSafepointInter
 JAVA_OPTS="$JAVA_OPTS -XX:+TrustFinalNonStaticFields -da -dsa -XX:+UseNUMA -XX:-EnableJVMCI"
 JAVA_OPTS="$JAVA_OPTS -Djdk.incubator.vector.VECTOR_ACCESS_OOB_CHECK=0"
 JAVA_OPTS="${JAVA_OPTS} -Dfile.path=src/test/resources/samples/measurements-10000-unique-keys.txt"
-if [[ ! "$(uname -s)" = "Darwin" ]]; then
-  JAVA_OPTS="$JAVA_OPTS -XX:+UseTransparentHugePages"
-fi
 
 # Set configs
 export USE_SHARED_ARENA=true

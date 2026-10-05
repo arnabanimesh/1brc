@@ -16,13 +16,13 @@
 #
 
 # ParallelGC test - Time (measured by evaluate2.sh): 00:33.130
-# JAVA_OPTS="--enable-preview -XX:+UseParallelGC -XX:+UseTransparentHugePages"
+# JAVA_OPTS="--enable-preview -XX:+UseParallelGC"
 
 # G1GC test - Time (measured by evaluate2.sh):  00:26.447
-# JAVA_OPTS="--enable-preview -XX:+UseG1GC -XX:+UseTransparentHugePages"
+# JAVA_OPTS="--enable-preview -XX:+UseG1GC"
 
 # ZGC test - Time (measured by evaluate2.sh): 00:22.813
-JAVA_OPTS="--enable-preview -XX:+UseZGC -XX:+UseTransparentHugePages"
+JAVA_OPTS="--enable-preview -XX:+UseZGC"
 
 # EpsilonGC test - for now doesnt work because heap space gets exhausted
 #JAVA_OPTS="--enable-preview -XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC -XX:+AlwaysPreTouch"

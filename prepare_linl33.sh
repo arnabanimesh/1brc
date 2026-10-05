@@ -23,7 +23,7 @@ CLASS_NAME="CalculateAverage_linl33"
 
 JAVA_OPTS="-Xrs --enable-preview --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
 JAVA_OPTS="${JAVA_OPTS} -XX:+UnlockDiagnosticVMOptions -XX:+UnlockExperimentalVMOptions"
-JAVA_OPTS="${JAVA_OPTS} -Xms128m -XX:+AlwaysPreTouch -XX:+AlwaysPreTouchStacks -XX:-UseTransparentHugePages"
+JAVA_OPTS="${JAVA_OPTS} -Xms128m -XX:+AlwaysPreTouch -XX:+AlwaysPreTouchStacks"
 JAVA_OPTS="${JAVA_OPTS} -XX:-UseCompressedClassPointers -XX:+ForceUnreachable -XX:-CompactStrings"
 JAVA_OPTS="${JAVA_OPTS} -XX:CodeEntryAlignment=64 -XX:OptoLoopAlignment=64 -XX:MaxLoopPad=16 -XX:ObjectAlignmentInBytes=64"
 JAVA_OPTS="${JAVA_OPTS} -XX:-UseLoopPredicate -XX:LoopStripMiningIter=0 -XX:LoopStripMiningIterShortLoop=0"

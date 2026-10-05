@@ -16,5 +16,5 @@
 #
 
 
-JAVA_OPTS="-XX:+UseShenandoahGC -XX:+UseStringDeduplication -XX:+UseTransparentHugePages -da"
+JAVA_OPTS="-XX:+UseShenandoahGC -XX:+UseStringDeduplication -da"
 java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_twobiers
