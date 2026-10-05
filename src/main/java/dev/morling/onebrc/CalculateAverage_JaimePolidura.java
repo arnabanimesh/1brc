@@ -15,31 +15,49 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.TreeMap;
 
+/**
+ * Java 22+ port: sun.misc.Unsafe is gone. Memory access now goes through the
+ * standard APIs that replace it:
+ * <ul>
+ * <li>off-heap (the mmapped file): {@link MemorySegment} + {@link ValueLayout} (JEP 454)</li>
+ * <li>on-heap (byte[] name buffers): {@link VarHandle} byte-array view (JEP 193)</li>
+ * </ul>
+ * All multi-byte reads are explicitly little-endian, because the SWAR tricks below
+ * (semicolon search, temperature parsing) depend on that byte order.
+ */
 public final class CalculateAverage_JaimePolidura {
     private static final String FILE = "./measurements.txt";
-    private static final Unsafe UNSAFE = initUnsafe();
     private static final long SEMICOLON_PATTERN = 0X3B3B3B3B3B3B3B3BL;
 
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
+    // Unaligned, little-endian 8-byte read from a MemorySegment
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    // Little-endian 8-byte read/write on a byte[]
+    private static final VarHandle BYTES_AS_LONG = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+
+    // Station names are at most 100 bytes. The name buffer is written one 8-byte word at a time,
+    // so it must have room for the whole last word: ceil(100 / 8) * 8 = 104. 128 leaves headroom.
+    private static final int NAME_BUFFER_SIZE = 128;
+
+    // A line is at most ~110 bytes and the parsers read whole 8-byte words, so they can read up to
+    // ~110 bytes past the start of a line. Lines starting closer than this to the end of the file
+    // are parsed from a zero-padded copy instead, so we never read outside the mapped segment.
+    private static final int TAIL_SAFETY_MARGIN = 128;
 
     public static void main(String[] args) throws Exception {
         Worker[] workers = createWorkers();
@@ -64,20 +82,27 @@ public final class CalculateAverage_JaimePolidura {
     }
 
     private static Worker[] createWorkers() throws Exception {
-        FileChannel channel = new RandomAccessFile(FILE, "r").getChannel();
-        MemorySegment mmappedFile = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), Arena.global());
+        long fileSize;
+        MemorySegment mmappedFile;
 
-        int nWorkers = channel.size() > 1024 * 1024 ? Runtime.getRuntime().availableProcessors() : 1;
+        // The mapping's lifetime is bound to the Arena, not to the channel, so the channel can be closed right away
+        try (RandomAccessFile channel = new RandomAccessFile(FILE, "r")) {
+            fileSize = channel.length();
+            mmappedFile = channel.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
+        }
+
+        int nWorkers = fileSize > 1024 * 1024 ? Runtime.getRuntime().availableProcessors() : 1;
         Worker[] workers = new Worker[nWorkers];
-        long quantityPerWorker = Math.floorDiv(channel.size(), nWorkers);
-        long quantityLastWorker = quantityPerWorker + (channel.size() % nWorkers);
+        long quantityPerWorker = Math.floorDiv(fileSize, nWorkers);
+        long quantityLastWorker = quantityPerWorker + (fileSize % nWorkers);
 
         for (int i = 0; i < nWorkers; i++) {
             boolean isLastWorker = i == nWorkers - 1;
 
-            long startAddr = mmappedFile.address() + quantityPerWorker * i;
-            long endAddr = startAddr + (isLastWorker ? quantityLastWorker : quantityPerWorker);
-            workers[i] = new Worker(mmappedFile, channel.size(), startAddr, endAddr);
+            // Offsets into the mapped segment (no raw addresses any more)
+            long startOffset = quantityPerWorker * i;
+            long endOffset = startOffset + (isLastWorker ? quantityLastWorker : quantityPerWorker);
+            workers[i] = new Worker(mmappedFile, fileSize, startOffset, endOffset);
             workers[i].setPriority(Thread.MAX_PRIORITY);
         }
 
@@ -92,7 +117,7 @@ public final class CalculateAverage_JaimePolidura {
 
             for (Result entry : worker.results.entries) {
                 if (entry != null) {
-                    String name = new String(entry.name, 0, entry.nameLength);
+                    String name = new String(entry.name, 0, entry.nameLength, StandardCharsets.UTF_8);
                     Result alreadyExistingResult = mergedResults.get(name);
                     if (alreadyExistingResult != null) {
                         alreadyExistingResult.min = Math.min(alreadyExistingResult.min, entry.min);
@@ -136,50 +161,80 @@ public final class CalculateAverage_JaimePolidura {
     }
 
     static class Worker extends Thread {
-        private final byte[] lastParsedNameBytes = new byte[100];
+        private final byte[] lastParsedNameBytes = new byte[NAME_BUFFER_SIZE];
         private int lastParsedNameLength;
         private long lastParsedNameHash;
         private int lastParsedTemperature;
 
         private final SimpleMap results;
         private final MemorySegment mmappedFile;
-        private final long mmappedFileSize;
-        private long currentAddr; // Will point to beginning of string
-        private long endAddr; // Will point to \n
+        private final long fileSize;
+        // Offsets are relative to whichever segment is currently being parsed
+        // (the mapped file, or the padded tail copy at the very end).
+        private long currentOffset; // Will point to beginning of string
+        private long endOffset; // Will point to \n
 
-        public Worker(MemorySegment mmappedFile, long mmappedFileSize, long startAddr, long endAddr) {
-            super("Worker[" + startAddr + ", " + endAddr + "]");
+        public Worker(MemorySegment mmappedFile, long fileSize, long startOffset, long endOffset) {
+            super("Worker[" + startOffset + ", " + endOffset + "]");
 
-            this.mmappedFileSize = mmappedFileSize;
+            this.fileSize = fileSize;
             this.mmappedFile = mmappedFile;
-            this.currentAddr = startAddr;
-            this.endAddr = endAddr;
+            this.currentOffset = startOffset;
+            this.endOffset = endOffset;
 
             this.results = new SimpleMap(roundUpToPowerOfTwo(1 << 16)); // 2^16
         }
 
         @Override
         public void run() {
-            adjustStartAddr();
-            adjustEndAddr();
+            adjustStartOffset();
+            adjustEndOffset();
 
-            if (this.currentAddr >= endAddr) {
+            if (this.currentOffset >= endOffset) {
                 return;
             }
 
-            while (currentAddr < endAddr) {
-                parseName();
-                parseTemperature();
+            // Fast path: every line that starts far enough from EOF can be parsed straight from the mapping
+            parseLines(mmappedFile, Math.min(endOffset, fileSize - TAIL_SAFETY_MARGIN));
 
-                this.currentAddr++; // We don't want it to point to \n
+            // Slow path: the last few lines of the file (only ever reached by the worker that owns EOF)
+            if (this.currentOffset < endOffset) {
+                parseTail();
+            }
+        }
+
+        private void parseLines(MemorySegment segment, long limit) {
+            while (currentOffset < limit) {
+                parseName(segment);
+                parseTemperature(segment);
+
+                this.currentOffset++; // We don't want it to point to \n
 
                 results.put(this.lastParsedNameHash, this.lastParsedNameBytes, this.lastParsedNameLength, this.lastParsedTemperature);
             }
         }
 
+        // Copies the remaining bytes of the file into a zero-padded native segment, so that the
+        // 8-byte word reads of the parsers cannot go past the end of the segment.
+        private void parseTail() {
+            long tailStart = this.currentOffset;
+            long tailLength = fileSize - tailStart;
+
+            try (Arena arena = Arena.ofConfined()) {
+                // Arena.allocate returns zeroed memory, so the padding after the copied bytes is 0x00
+                MemorySegment tail = arena.allocate(tailLength + TAIL_SAFETY_MARGIN);
+                MemorySegment.copy(mmappedFile, tailStart, tail, 0, tailLength);
+
+                this.currentOffset = 0;
+                this.endOffset -= tailStart;
+
+                parseLines(tail, endOffset);
+            }
+        }
+
         // Idea from Quan Anh Mai's implementation
-        private void parseTemperature() {
-            long numberWord = UNSAFE.getLong(currentAddr);
+        private void parseTemperature(MemorySegment segment) {
+            long numberWord = segment.get(LONG_LE, currentOffset);
 
             // The 4th binary digit of the ascii (Starting from left) of a digit is 1 while '.' is 0
             int decimalSepPos = Long.numberOfTrailingZeros(~numberWord & 0x10101000);
@@ -220,43 +275,38 @@ public final class CalculateAverage_JaimePolidura {
 
             long signedValue = (absValue ^ signed) - signed;
 
-            this.currentAddr += (((decimalSepPos - 4) / 8) + 2);
+            this.currentOffset += (((decimalSepPos - 4) / 8) + 2);
 
             this.lastParsedTemperature = (int) signedValue;
         }
 
         // I first saw this idea in Artsiom Korzun's implementation
-        private void parseName() {
-            this.lastParsedNameHash = 0;
-
+        private void parseName(MemorySegment segment) {
             long totalWordHash = 0;
             int totalWordLength = 0;
 
             for (;;) {
-                long actualWord = UNSAFE.getLong(currentAddr + totalWordLength);
+                long actualWord = segment.get(LONG_LE, currentOffset + totalWordLength);
                 long hasSemicolon = hasByte(actualWord, SEMICOLON_PATTERN);
 
                 if (hasSemicolon != 0) {
                     int actualLength = Long.numberOfTrailingZeros(hasSemicolon) >> 3;
-                    if (actualLength == 0) {
-                        actualWord = 0;
-                    }
 
                     actualWord = mask(actualWord, actualLength);
 
-                    UNSAFE.putLong(this.lastParsedNameBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET + totalWordLength, actualWord);
+                    BYTES_AS_LONG.set(this.lastParsedNameBytes, totalWordLength, actualWord);
 
                     totalWordHash ^= actualWord;
                     totalWordLength += actualLength;
 
                     this.lastParsedNameLength = totalWordLength;
                     this.lastParsedNameHash = totalWordHash;
-                    this.currentAddr += totalWordLength + 1; // +1 Because we don't want to point to ';'
+                    this.currentOffset += totalWordLength + 1; // +1 Because we don't want to point to ';'
 
                     break;
                 }
                 else {
-                    UNSAFE.putLong(this.lastParsedNameBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET + totalWordLength, actualWord);
+                    BYTES_AS_LONG.set(this.lastParsedNameBytes, totalWordLength, actualWord);
 
                     totalWordLength += 8;
                     totalWordHash ^= actualWord;
@@ -264,37 +314,39 @@ public final class CalculateAverage_JaimePolidura {
             }
         }
 
-        // Removes "garbage" of a word byte
-        private long mask(long word, int length) {
-            int shift = (8 - length) * 8;
-            return (word << shift) >> shift;
+        // Removes "garbage" of a word: keeps the first `length` bytes (0..7) and zeroes the rest.
+        // Works for length == 0 as well (shift of 0 -> mask of 0), so no special case is needed.
+        // NOTE: this must zero-fill. The previous (word << s) >> s sign-extended, which put 0xFF
+        // padding after names whose last byte was >= 0x80 (UTF-8 multibyte characters).
+        private static long mask(long word, int length) {
+            return word & ~(-1L << (length << 3));
         }
 
-        private long hasByte(long word, long pattern) {
+        private static long hasByte(long word, long pattern) {
             long patternMatch = word ^ pattern;
             return (patternMatch - 0x0101010101010101L) & (~patternMatch & 0x8080808080808080L);
         }
 
-        private void adjustStartAddr() {
-            if (currentAddr == this.mmappedFile.address()) {
+        private void adjustStartOffset() {
+            if (currentOffset == 0) {
                 return;
             }
 
-            while (UNSAFE.getByte(currentAddr) != '\n' && currentAddr != endAddr) {
-                currentAddr++;
+            // Bounds are checked first: MemorySegment (unlike Unsafe) throws on out-of-range reads
+            while (currentOffset < endOffset && mmappedFile.get(BYTE, currentOffset) != '\n') {
+                currentOffset++;
             }
 
-            currentAddr++; // We want it to point to the first character instead of \n
+            currentOffset++; // We want it to point to the first character instead of \n
         }
 
-        private void adjustEndAddr() {
-            long endAddressMmappedFile = mmappedFile.address() + mmappedFileSize;
-            if (endAddr >= endAddressMmappedFile) {
+        private void adjustEndOffset() {
+            if (endOffset >= fileSize) {
                 return;
             }
 
-            while (UNSAFE.getByte(endAddr) != '\n' && endAddr != endAddressMmappedFile) {
-                endAddr++;
+            while (endOffset < fileSize && mmappedFile.get(BYTE, endOffset) != '\n') {
+                endOffset++;
             }
         }
     }
@@ -315,8 +367,9 @@ public final class CalculateAverage_JaimePolidura {
                 Result actualEntry = entries[index];
 
                 if (actualEntry == null) {
-                    byte[] nameToPutCopy = new byte[nameLength];
-                    UNSAFE.copyMemory(nameToPut, Unsafe.ARRAY_BYTE_BASE_OFFSET, nameToPutCopy, Unsafe.ARRAY_BYTE_BASE_OFFSET, nameLength);
+                    // Copy rounded up to a multiple of 8 so that Result.isSameName can always read whole words.
+                    // nameToPut is zero-padded after nameLength (see Worker.parseName), so the padding is 0x00.
+                    byte[] nameToPutCopy = Arrays.copyOf(nameToPut, (nameLength + 7) & ~7);
 
                     entries[index] = new Result(hashToPut, nameToPutCopy, nameLength, valueToPut,
                             valueToPut, valueToPut, 1);
@@ -340,7 +393,7 @@ public final class CalculateAverage_JaimePolidura {
     }
 
     static class Result {
-        public byte[] name;
+        public byte[] name; // length is nameLength rounded up to a multiple of 8, zero-padded
         public int nameLength;
         public int max;
         public int min;
@@ -362,14 +415,11 @@ public final class CalculateAverage_JaimePolidura {
             return this.nameLength == otherNameLength && isSameNameBytes(otherNameBytes);
         }
 
+        // Both arrays are zero-padded up to the next multiple of 8, so whole words can be compared directly
         private boolean isSameNameBytes(byte[] otherNameBytes) {
             for (int i = 0; i < this.nameLength; i += 8) {
-                long thisNameBytesAsLong = UNSAFE.getLong(this.name, Unsafe.ARRAY_BYTE_BASE_OFFSET + i);
-                long otherNameBytesAsLong = UNSAFE.getLong(otherNameBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET + i);
-
-                int isPositiveAsInt = (((8 - nameLength + i) >> 31) & 1) ^ 0x01;
-                int shift = ((8 - nameLength + i) * isPositiveAsInt) * 8;
-                otherNameBytesAsLong = (otherNameBytesAsLong << shift) >>> shift;
+                long thisNameBytesAsLong = (long) BYTES_AS_LONG.get(this.name, i);
+                long otherNameBytesAsLong = (long) BYTES_AS_LONG.get(otherNameBytes, i);
 
                 if (thisNameBytesAsLong != otherNameBytesAsLong) {
                     return false;

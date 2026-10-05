@@ -16,6 +16,10 @@
 package dev.morling.onebrc;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -33,14 +37,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * The goal here was to try to improve the runtime of his 10k
  * solution of: 00:04.516
- * 
+ *
  * With Thomas latest changes, his time is probably much better
  * already, and maybe even 1st place for the 10k too.
  * See: https://github.com/gunnarmorling/1brc/pull/606
- * 
+ *
  * As I was not able to make it faster ... so I'll make it slower,
  * because my current solution should *not* stay at the top, as it added
  * basically nothing.
+ *
+ * Java 27 port: sun.misc.Unsafe memory access (denied by default since
+ * JDK 26, JEP 471/498) was replaced by the standard Foreign Function &amp;
+ * Memory API (java.lang.foreign, final since JDK 22). All "addresses" are
+ * now plain offsets into one mapped MemorySegment. No JVM flags needed.
  */
 public class CalculateAverage_tivrfoa {
     private static final String FILE = "./measurements.txt";
@@ -53,6 +62,24 @@ public class CalculateAverage_tivrfoa {
     private static long[] chunks;
     private static int numChunks;
 
+    // The whole file, mapped once. Valid for the lifetime of the JVM (global arena).
+    private static final MemorySegment FILE_SEGMENT = mapFile();
+    private static final long FILE_SIZE = FILE_SEGMENT.byteSize();
+    // Any 8-byte read starting at an offset <= this value is fully inside the file.
+    private static final long LAST_FULL_WORD_OFFSET = FILE_SIZE - Long.BYTES;
+    // The SWAR tricks below assume little-endian word layout; stating it explicitly
+    // keeps the code correct on any platform (it is a no-op on x86-64 / AArch64).
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    private static MemorySegment mapFile() {
+        try (var fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+            return fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileChannel.size(), Arena.global());
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     // Holding the current result for a single city.
     private static class Result {
         long lastNameLong;
@@ -61,7 +88,7 @@ public class CalculateAverage_tivrfoa {
         short min, max;
         long sum;
 
-        private Result(short number, long nameAddress, byte nameLength, Scanner scanner) {
+        private Result(short number, long nameOffset, byte nameLength, Scanner scanner) {
             this.min = number;
             this.max = number;
             this.sum = number;
@@ -70,11 +97,11 @@ public class CalculateAverage_tivrfoa {
             name = new long[(nameLength / Long.BYTES) + 1];
             int pos = 0, i = 0;
             for (; i < nameLength + 1 - Long.BYTES; i += Long.BYTES) {
-                name[pos++] = scanner.getLongAt(nameAddress + i);
+                name[pos++] = scanner.getLongAt(nameOffset + i);
             }
 
             int remainingShift = (64 - (nameLength + 1 - i) << 3);
-            lastNameLong = (scanner.getLongAt(nameAddress + i) << remainingShift);
+            lastNameLong = (scanner.getLongAt(nameOffset + i) << remainingShift);
             name[pos] = lastNameLong >> remainingShift;
         }
 
@@ -110,7 +137,7 @@ public class CalculateAverage_tivrfoa {
         }
 
         public String calcName() {
-            ByteBuffer bb = ByteBuffer.allocate(name.length * Long.BYTES).order(ByteOrder.nativeOrder());
+            ByteBuffer bb = ByteBuffer.allocate(name.length * Long.BYTES).order(ByteOrder.LITTLE_ENDIAN);
             bb.asLongBuffer().put(name);
             byte[] array = bb.array();
             int i = 0;
@@ -123,14 +150,14 @@ public class CalculateAverage_tivrfoa {
     /**
      * From:
      * https://github.com/OpenHFT/Zero-Allocation-Hashing/blob/ea/src/main/java/net/openhft/hashing/XXH3.java
-     * 
+     *
      * Less collisions, but it will make the code slower. xD
-     * 
+     *
      * One interesting thing about Thomas' solution that I
      * started to work with (d0a28599), is that it basically does not have
      * any collision for the small data set (sometimes none!), but it
      * has lots of collisions for the 10k, hence its poor performance.
-     * 
+     *
      */
     private static long XXH3_avalanche(long h64) {
         h64 ^= h64 >>> 37;
@@ -155,7 +182,7 @@ public class CalculateAverage_tivrfoa {
                 long word = scanner.getLong();
                 long pos = findDelimiter(word);
                 while (scanner.hasNext()) {
-                    long nameAddress = scanner.pos();
+                    long nameOffset = scanner.pos();
                     long hash = 0;
 
                     while (true) {
@@ -175,14 +202,14 @@ public class CalculateAverage_tivrfoa {
                         pos = findDelimiter(word);
                     }
 
-                    byte nameLength = (byte) (scanner.pos() - nameAddress);
+                    byte nameLength = (byte) (scanner.pos() - nameOffset);
                     short number = scanNumber(scanner);
 
                     int tableIndex = hashToIndex(hash);
                     outer: while (true) {
                         Result existingResult = buckets[tableIndex];
                         if (existingResult == null) {
-                            var newResult = new Result(number, nameAddress, nameLength, scanner);
+                            var newResult = new Result(number, nameOffset, nameLength, scanner);
                             buckets[tableIndex] = newResult;
                             results[resIdx++] = newResult;
                             break;
@@ -190,14 +217,14 @@ public class CalculateAverage_tivrfoa {
                         int i = 0;
                         int namePos = 0;
                         for (; i < nameLength + 1 - 8; i += 8) {
-                            if (namePos >= existingResult.name.length || existingResult.name[namePos++] != scanner.getLongAt(nameAddress + i)) {
+                            if (namePos >= existingResult.name.length || existingResult.name[namePos++] != scanner.getLongAt(nameOffset + i)) {
                                 tableIndex = (tableIndex + 31) & (LAST_BUCKET_ENTRY);
                                 continue outer;
                             }
                         }
 
                         int remainingShift = (64 - (nameLength + 1 - i) << 3);
-                        if (((existingResult.lastNameLong ^ (scanner.getLongAt(nameAddress + i) << remainingShift)) == 0)) {
+                        if (((existingResult.lastNameLong ^ (scanner.getLongAt(nameOffset + i) << remainingShift)) == 0)) {
                             existingResult.add(number);
                             break;
                         }
@@ -224,7 +251,7 @@ public class CalculateAverage_tivrfoa {
         }
     }
 
-    public static void main(String[] args) throws InterruptedException, IOException {
+    public static void main(String[] args) throws InterruptedException {
         chunks = getSegments(NUM_CPUS);
         numChunks = chunks.length - 1;
         final SolveChunk[] threads = new SolveChunk[NUM_CPUS];
@@ -297,60 +324,44 @@ public class CalculateAverage_tivrfoa {
 
     /**
      *  - Split 70% of the file in even chunks for all cpus;
-     *  - Create smaller chunks for the remainder of the file.  
+     *  - Create smaller chunks for the remainder of the file.
+     *
+     *  Returns chunk boundaries as offsets into FILE_SEGMENT.
      */
-    private static long[] getSegments(int cpus) throws IOException {
-        try (var fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
-            final long fileSize = fileChannel.size();
-            final long part1 = (long) (fileSize * 0.7);
-            final long part2 = (long) (fileSize * 0.2);
-            final long part3 = fileSize - part1 - part2;
-            final long bigChunkSize = (part1 - 1) / cpus;
-            final long smallChunkSize1 = (part2 - 1) / (cpus * 3);
-            final long smallChunkSize2 = (part3 - 1) / (cpus * 3);
-            final int numChunks = cpus + cpus * 3 + cpus * 3;
-            final long[] sizes = new long[numChunks];
-            int l = 0, r = cpus;
-            Arrays.fill(sizes, l, r, bigChunkSize);
-            l = r;
-            r = l + cpus * 3;
-            Arrays.fill(sizes, l, r, smallChunkSize1);
-            l = r;
-            r = l + cpus * 3;
-            Arrays.fill(sizes, l, r, smallChunkSize2);
-            final long[] chunks = new long[sizes.length + 1];
-            final long mappedAddress = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, java.lang.foreign.Arena.global()).address();
-            chunks[0] = mappedAddress;
-            final long endAddress = mappedAddress + fileSize;
-            final Scanner s = new Scanner(mappedAddress, mappedAddress + fileSize);
-            for (int i = 1, sizeIdx = 0; i < chunks.length - 1; ++i, sizeIdx = (sizeIdx + 1) % sizes.length) {
-                long chunkAddress = chunks[i - 1] + sizes[sizeIdx];
-                // Align to first row start.
-                while (chunkAddress < endAddress && (s.getLongAt(chunkAddress++) & 0xFF) != '\n')
-                    ;
-                chunks[i] = Math.min(chunkAddress, endAddress);
-                // System.err.printf("Chunk size %d\n", chunks[i] - chunks[i - 1]);
-            }
-            chunks[chunks.length - 1] = endAddress;
-            // System.err.printf("Chunk size %d\n", chunks[chunks.length - 1] - chunks[chunks.length - 2]);
-            return chunks;
+    private static long[] getSegments(int cpus) {
+        final long fileSize = FILE_SIZE;
+        final long part1 = (long) (fileSize * 0.7);
+        final long part2 = (long) (fileSize * 0.2);
+        final long part3 = fileSize - part1 - part2;
+        final long bigChunkSize = (part1 - 1) / cpus;
+        final long smallChunkSize1 = (part2 - 1) / (cpus * 3);
+        final long smallChunkSize2 = (part3 - 1) / (cpus * 3);
+        final int numChunks = cpus + cpus * 3 + cpus * 3;
+        final long[] sizes = new long[numChunks];
+        int l = 0, r = cpus;
+        Arrays.fill(sizes, l, r, bigChunkSize);
+        l = r;
+        r = l + cpus * 3;
+        Arrays.fill(sizes, l, r, smallChunkSize1);
+        l = r;
+        r = l + cpus * 3;
+        Arrays.fill(sizes, l, r, smallChunkSize2);
+        final long[] chunks = new long[sizes.length + 1];
+        chunks[0] = 0;
+        for (int i = 1, sizeIdx = 0; i < chunks.length - 1; ++i, sizeIdx = (sizeIdx + 1) % sizes.length) {
+            long chunkOffset = chunks[i - 1] + sizes[sizeIdx];
+            // Align to first row start.
+            while (chunkOffset < fileSize && FILE_SEGMENT.get(ValueLayout.JAVA_BYTE, chunkOffset++) != '\n')
+                ;
+            chunks[i] = Math.min(chunkOffset, fileSize);
+            // System.err.printf("Chunk size %d\n", chunks[i] - chunks[i - 1]);
         }
+        chunks[chunks.length - 1] = fileSize;
+        // System.err.printf("Chunk size %d\n", chunks[chunks.length - 1] - chunks[chunks.length - 2]);
+        return chunks;
     }
 
     private static class Scanner {
-
-        private static final sun.misc.Unsafe UNSAFE = initUnsafe();
-
-        private static sun.misc.Unsafe initUnsafe() {
-            try {
-                java.lang.reflect.Field theUnsafe = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-                theUnsafe.setAccessible(true);
-                return (sun.misc.Unsafe) theUnsafe.get(sun.misc.Unsafe.class);
-            }
-            catch (NoSuchFieldException | IllegalAccessException e) {
-                throw new RuntimeException(e);
-            }
-        }
 
         long pos, end;
 
@@ -372,11 +383,25 @@ public class CalculateAverage_tivrfoa {
         }
 
         long getLong() {
-            return UNSAFE.getLong(pos);
+            return getLongAt(pos);
         }
 
-        long getLongAt(long pos) {
-            return UNSAFE.getLong(pos);
+        // Reads 8 bytes at the given file offset. The old Unsafe code could silently read a few
+        // bytes past the end of the mapping; MemorySegment is bounds-checked, so the last
+        // (at most 7) bytes of the file take a slower, zero-padded path.
+        long getLongAt(long offset) {
+            if (offset <= LAST_FULL_WORD_OFFSET) {
+                return FILE_SEGMENT.get(LONG_LE, offset);
+            }
+            return getTailLong(offset);
+        }
+
+        private static long getTailLong(long offset) {
+            long word = 0;
+            for (int i = 0; i < Long.BYTES && offset + i < FILE_SIZE; i++) {
+                word |= (FILE_SEGMENT.get(ValueLayout.JAVA_BYTE, offset + i) & 0xFFL) << (i << 3);
+            }
+            return word;
         }
 
         void setPos(long l) {

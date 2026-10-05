@@ -17,12 +17,9 @@
 
 # Basics
 JAVA_OPTS=""
-JAVA_OPTS="$JAVA_OPTS --enable-preview"
+JAVA_OPTS="$JAVA_OPTS --enable-preview --enable-native-access=ALL-UNNAMED"
 JAVA_OPTS="$JAVA_OPTS --add-exports java.base/jdk.internal.ref=ALL-UNNAMED"
 JAVA_OPTS="$JAVA_OPTS --add-opens java.base/java.nio=ALL-UNNAMED"
-
-# JIT parameters
-JAVA_OPTS="$JAVA_OPTS -XX:+AlwaysCompileLoopMethods"
 
 # GC parameters
 JAVA_OPTS="$JAVA_OPTS -XX:+UseParallelGC"

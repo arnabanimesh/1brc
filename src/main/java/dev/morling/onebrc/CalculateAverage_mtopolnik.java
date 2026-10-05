@@ -15,40 +15,40 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
-import java.io.File;
-import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
-import java.nio.ByteBuffer;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 
 import static java.lang.ProcessBuilder.Redirect.PIPE;
 import static java.util.Arrays.asList;
 
+/**
+ * Java 22+ version (tested on JDK 27) that no longer uses {@code sun.misc.Unsafe}, whose
+ * memory-access methods are terminally deprecated (JEP 471 / JEP 498). Replacements:
+ * <ul>
+ * <li>memory-mapped input file: {@link MemorySegment} (Foreign Function &amp; Memory API, final in JDK 22)</li>
+ * <li>per-thread stats hash table: on-heap {@code byte[]} accessed via
+ * {@link MethodHandles#byteArrayViewVarHandle} (same 128-byte slot layout as before)</li>
+ * </ul>
+ */
 public class CalculateAverage_mtopolnik {
-    private static final Unsafe UNSAFE = unsafe();
-    private static final int MAX_NAME_LEN = 100;
+    // Layouts for reading the memory-mapped input (unaligned, little endian byte order)
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
     private static final int STATS_TABLE_SIZE = 1 << 16;
     private static final int TABLE_INDEX_MASK = STATS_TABLE_SIZE - 1;
     private static final String MEASUREMENTS_TXT = "measurements.txt";
-
-    private static Unsafe unsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
 
     public static void main(String[] args) throws Exception {
         if (args.length >= 1 && args[0].equals("--worker")) {
@@ -61,7 +61,7 @@ public class CalculateAverage_mtopolnik {
         cmdLine.add(curProcInfo.command().get());
         cmdLine.addAll(asList(curProcInfo.arguments().get()));
         cmdLine.add("--worker");
-        var process = new ProcessBuilder()
+        new ProcessBuilder()
                 .command(cmdLine)
                 .inheritIO().redirectOutput(PIPE)
                 .start()
@@ -70,26 +70,25 @@ public class CalculateAverage_mtopolnik {
     }
 
     static void calculate() throws Exception {
-        final File file = new File(MEASUREMENTS_TXT);
-        final long length = file.length();
         final int chunkCount = Runtime.getRuntime().availableProcessors();
         final var results = new StationStats[chunkCount][];
         final var chunkStartOffsets = new long[chunkCount];
-        try (var raf = new RandomAccessFile(file, "r")) {
-            final var inputBase = raf.getChannel().map(MapMode.READ_ONLY, 0, length, Arena.global()).address();
+        try (var channel = FileChannel.open(Path.of(MEASUREMENTS_TXT), StandardOpenOption.READ)) {
+            final long length = channel.size();
+            // The global arena is never closed, so the mapping stays valid for all worker threads
+            final MemorySegment file = channel.map(MapMode.READ_ONLY, 0, length, Arena.global());
             for (int i = 1; i < chunkStartOffsets.length; i++) {
-                var start = length * i / chunkStartOffsets.length;
-                raf.seek(start);
-                while (raf.read() != (byte) '\n') {
+                long start = length * i / chunkStartOffsets.length;
+                while (start < length && file.get(BYTE, start) != '\n') {
+                    start++;
                 }
-                start = raf.getFilePointer();
-                chunkStartOffsets[i] = start;
+                chunkStartOffsets[i] = Math.min(start + 1, length);
             }
             var threads = new Thread[chunkCount];
             for (int i = 0; i < chunkCount; i++) {
                 final long chunkStart = chunkStartOffsets[i];
                 final long chunkLimit = (i + 1 < chunkCount) ? chunkStartOffsets[i + 1] : length;
-                threads[i] = new Thread(new ChunkProcessor(inputBase + chunkStart, inputBase + chunkLimit, results, i));
+                threads[i] = new Thread(new ChunkProcessor(file, chunkStart, chunkLimit, results, i));
             }
             for (var thread : threads) {
                 thread.start();
@@ -102,18 +101,25 @@ public class CalculateAverage_mtopolnik {
     }
 
     private static class ChunkProcessor implements Runnable {
-        private static final int CACHELINE_SIZE = 64;
+        // The longest line is 107 bytes (100-byte name, ';', "-99.9", '\n') and the
+        // word-at-a-time parsing reads up to 7 bytes beyond its end. Unsafe let us get
+        // away with reading past the end of the mapped file; MemorySegment bounds-checks.
+        // So the last SAFE_TAIL bytes of the file are processed from a zero-padded copy.
+        private static final long SAFE_TAIL = 128;
+        private static final long TAIL_PADDING = 16;
 
-        private final long inputBase;
-        private final long inputSize;
+        private final MemorySegment file;
+        private final long chunkStart;
+        private final long chunkLimit;
         private final StationStats[][] results;
         private final int myIndex;
 
         private StatsAccessor stats;
 
-        ChunkProcessor(long chunkStart, long chunkLimit, StationStats[][] results, int myIndex) {
-            this.inputBase = chunkStart;
-            this.inputSize = chunkLimit - chunkStart;
+        ChunkProcessor(MemorySegment file, long chunkStart, long chunkLimit, StationStats[][] results, int myIndex) {
+            this.file = file;
+            this.chunkStart = chunkStart;
+            this.chunkLimit = chunkLimit;
             this.results = results;
             this.myIndex = myIndex;
         }
@@ -121,30 +127,35 @@ public class CalculateAverage_mtopolnik {
         @Override
         public void run() {
             try (Arena confinedArena = Arena.ofConfined()) {
-                long totalAllocated = 0;
-                String threadName = Thread.currentThread().getName();
-                long statsByteSize = STATS_TABLE_SIZE * StatsAccessor.SIZEOF;
-                var diagnosticString = String.format("Thread %s needs %,d bytes", threadName, statsByteSize);
-                try {
-                    stats = new StatsAccessor(confinedArena.allocate(statsByteSize, CACHELINE_SIZE));
-                }
-                catch (OutOfMemoryError e) {
-                    System.err.print(diagnosticString);
-                    throw e;
-                }
-                processChunk();
+                stats = new StatsAccessor(new byte[STATS_TABLE_SIZE * StatsAccessor.SIZEOF]);
+                processChunk(confinedArena);
                 exportResults();
             }
         }
 
-        private void processChunk() {
-            final long inputSize = this.inputSize;
-            final long inputBase = this.inputBase;
-            long cursor = 0;
+        private void processChunk(Arena arena) {
+            final long fileLength = file.byteSize();
+            // Only a chunk that reaches the end of the file can read out of bounds
+            final long fastLimit = chunkLimit == fileLength
+                    ? Math.max(chunkStart, fileLength - SAFE_TAIL)
+                    : chunkLimit;
+            final long cursor = processLines(file, chunkStart, fastLimit);
+            if (cursor < chunkLimit) {
+                final long tailLength = chunkLimit - cursor;
+                // Arena allocations are zero-initialized, so the padding is already zero
+                final MemorySegment tail = arena.allocate(tailLength + TAIL_PADDING, Long.BYTES);
+                MemorySegment.copy(file, cursor, tail, 0, tailLength);
+                processLines(tail, 0, tailLength);
+            }
+        }
+
+        // Processes whole lines starting at 'cursor' until the cursor reaches 'end';
+        // returns the offset of the first unprocessed line.
+        private long processLines(MemorySegment input, long cursor, long end) {
             long lastNameWord;
-            while (cursor < inputSize) {
-                long nameStartAddress = inputBase + cursor;
-                long nameWord0 = UNSAFE.getLong(nameStartAddress);
+            while (cursor < end) {
+                long nameStart = cursor;
+                long nameWord0 = input.get(LONG, nameStart);
                 long nameWord1 = 0;
                 long matchBits = semicolonMatchBits(nameWord0);
                 long hash;
@@ -154,7 +165,7 @@ public class CalculateAverage_mtopolnik {
                     nameLen = nameLen(matchBits);
                     nameWord0 = maskWord(nameWord0, matchBits);
                     cursor += nameLen;
-                    long tempWord = UNSAFE.getLong(inputBase + cursor);
+                    long tempWord = input.get(LONG, cursor);
                     int dotPos = dotPos(tempWord);
                     temperature = parseTemperature(tempWord, dotPos);
                     cursor += (dotPos >> 3) + 3;
@@ -167,13 +178,13 @@ public class CalculateAverage_mtopolnik {
                 }
                 else { // nameLen > 8
                     hash = hash(nameWord0);
-                    nameWord1 = UNSAFE.getLong(nameStartAddress + Long.BYTES);
+                    nameWord1 = input.get(LONG, nameStart + Long.BYTES);
                     matchBits = semicolonMatchBits(nameWord1);
                     if (matchBits != 0) {
                         nameLen = Long.BYTES + nameLen(matchBits);
                         nameWord1 = maskWord(nameWord1, matchBits);
                         cursor += nameLen;
-                        long tempWord = UNSAFE.getLong(inputBase + cursor);
+                        long tempWord = input.get(LONG, cursor);
                         int dotPos = dotPos(tempWord);
                         temperature = parseTemperature(tempWord, dotPos);
                         cursor += (dotPos >> 3) + 3;
@@ -186,13 +197,13 @@ public class CalculateAverage_mtopolnik {
                     else { // nameLen > 16
                         nameLen = 2 * Long.BYTES;
                         while (true) {
-                            lastNameWord = UNSAFE.getLong(nameStartAddress + nameLen);
+                            lastNameWord = input.get(LONG, nameStart + nameLen);
                             matchBits = semicolonMatchBits(lastNameWord);
                             if (matchBits != 0) {
                                 nameLen += nameLen(matchBits);
                                 lastNameWord = maskWord(lastNameWord, matchBits);
                                 cursor += nameLen;
-                                long tempWord = UNSAFE.getLong(inputBase + cursor);
+                                long tempWord = input.get(LONG, cursor);
                                 int dotPos = dotPos(tempWord);
                                 temperature = parseTemperature(tempWord, dotPos);
                                 cursor += (dotPos >> 3) + 3;
@@ -202,8 +213,9 @@ public class CalculateAverage_mtopolnik {
                         }
                     }
                 }
-                stats.gotoAndObserve(hash, nameStartAddress, nameLen, nameWord0, nameWord1, lastNameWord, temperature);
+                stats.gotoAndObserve(input, hash, nameStart, nameLen, nameWord0, nameWord1, lastNameWord, temperature);
             }
+            return cursor;
         }
 
         private static final long BROADCAST_SEMICOLON = 0x3B3B3B3B3B3B3B3BL;
@@ -271,28 +283,29 @@ public class CalculateAverage_mtopolnik {
     }
 
     static class StatsAccessor {
+        private static final VarHandle LONG_VH = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN);
+        private static final VarHandle INT_VH = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.LITTLE_ENDIAN);
+        private static final VarHandle SHORT_VH = MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.LITTLE_ENDIAN);
+
         static final int NAME_SLOT_SIZE = 104;
-        static final long HASH_OFFSET = 0;
-        static final long NAMELEN_OFFSET = HASH_OFFSET + Long.BYTES;
-        static final long SUM_OFFSET = NAMELEN_OFFSET + Integer.BYTES;
-        static final long COUNT_OFFSET = SUM_OFFSET + Integer.BYTES;
-        static final long MIN_OFFSET = COUNT_OFFSET + Integer.BYTES;
-        static final long MAX_OFFSET = MIN_OFFSET + Short.BYTES;
-        static final long NAME_OFFSET = MAX_OFFSET + Short.BYTES;
-        static final long SIZEOF = (NAME_OFFSET + NAME_SLOT_SIZE - 1) / 8 * 8 + 8;
+        static final int HASH_OFFSET = 0;
+        static final int NAMELEN_OFFSET = HASH_OFFSET + Long.BYTES;
+        static final int SUM_OFFSET = NAMELEN_OFFSET + Integer.BYTES;
+        static final int COUNT_OFFSET = SUM_OFFSET + Integer.BYTES;
+        static final int MIN_OFFSET = COUNT_OFFSET + Integer.BYTES;
+        static final int MAX_OFFSET = MIN_OFFSET + Short.BYTES;
+        static final int NAME_OFFSET = MAX_OFFSET + Short.BYTES;
+        static final int SIZEOF = (NAME_OFFSET + NAME_SLOT_SIZE - 1) / 8 * 8 + 8;
 
-        static final int ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
+        private final byte[] table;
+        private int slotBase;
 
-        private final long address;
-        private long slotBase;
-
-        StatsAccessor(MemorySegment memSeg) {
-            memSeg.fill((byte) 0);
-            this.address = memSeg.address();
+        StatsAccessor(byte[] table) {
+            this.table = table;
         }
 
         void gotoIndex(int index) {
-            slotBase = address + index * SIZEOF;
+            slotBase = index * SIZEOF;
         }
 
         private boolean gotoName0(long hash, long nameWord0) {
@@ -306,79 +319,77 @@ public class CalculateAverage_mtopolnik {
         }
 
         long hash() {
-            return UNSAFE.getLong(slotBase + HASH_OFFSET);
+            return (long) LONG_VH.get(table, slotBase + HASH_OFFSET);
         }
 
         int nameLen() {
-            return UNSAFE.getInt(slotBase + NAMELEN_OFFSET);
+            return (int) INT_VH.get(table, slotBase + NAMELEN_OFFSET);
         }
 
         int sum() {
-            return UNSAFE.getInt(slotBase + SUM_OFFSET);
+            return (int) INT_VH.get(table, slotBase + SUM_OFFSET);
         }
 
         int count() {
-            return UNSAFE.getInt(slotBase + COUNT_OFFSET);
+            return (int) INT_VH.get(table, slotBase + COUNT_OFFSET);
         }
 
         short min() {
-            return UNSAFE.getShort(slotBase + MIN_OFFSET);
+            return (short) SHORT_VH.get(table, slotBase + MIN_OFFSET);
         }
 
         short max() {
-            return UNSAFE.getShort(slotBase + MAX_OFFSET);
+            return (short) SHORT_VH.get(table, slotBase + MAX_OFFSET);
         }
 
-        long nameAddress() {
+        int nameOffset() {
             return slotBase + NAME_OFFSET;
         }
 
         long nameWord0() {
-            return UNSAFE.getLong(nameAddress());
+            return (long) LONG_VH.get(table, nameOffset());
         }
 
         long nameWord1() {
-            return UNSAFE.getLong(nameAddress() + Long.BYTES);
+            return (long) LONG_VH.get(table, nameOffset() + Long.BYTES);
         }
 
         String exportNameString() {
-            final var bytes = new byte[nameLen() - 1];
-            UNSAFE.copyMemory(null, nameAddress(), bytes, ARRAY_BASE_OFFSET, bytes.length);
-            return new String(bytes, StandardCharsets.UTF_8);
+            return new String(table, nameOffset(), nameLen() - 1, StandardCharsets.UTF_8);
         }
 
         void setHash(long hash) {
-            UNSAFE.putLong(slotBase + HASH_OFFSET, hash);
+            LONG_VH.set(table, slotBase + HASH_OFFSET, hash);
         }
 
         void setNameLen(int nameLen) {
-            UNSAFE.putInt(slotBase + NAMELEN_OFFSET, nameLen);
+            INT_VH.set(table, slotBase + NAMELEN_OFFSET, nameLen);
         }
 
         void setSum(int sum) {
-            UNSAFE.putInt(slotBase + SUM_OFFSET, sum);
+            INT_VH.set(table, slotBase + SUM_OFFSET, sum);
         }
 
         void setCount(int count) {
-            UNSAFE.putInt(slotBase + COUNT_OFFSET, count);
+            INT_VH.set(table, slotBase + COUNT_OFFSET, count);
         }
 
         void setMin(short min) {
-            UNSAFE.putShort(slotBase + MIN_OFFSET, min);
+            SHORT_VH.set(table, slotBase + MIN_OFFSET, min);
         }
 
         void setMax(short max) {
-            UNSAFE.putShort(slotBase + MAX_OFFSET, max);
+            SHORT_VH.set(table, slotBase + MAX_OFFSET, max);
         }
 
         void gotoAndObserve(
-                            long hash, long nameStartAddress, int nameLen, long nameWord0, long nameWord1, long lastNameWord,
-                            int temperature) {
+                            MemorySegment input, long hash, long nameStart, int nameLen, long nameWord0, long nameWord1,
+                            long lastNameWord, int temperature) {
             int tableIndex = (int) (hash & TABLE_INDEX_MASK);
             while (true) {
                 gotoIndex(tableIndex);
                 if (hash() == hash && nameLen() == nameLen && nameEquals(
-                        nameAddress(), nameStartAddress, nameLen, nameWord0, nameWord1, lastNameWord)) {
+                        input, nameStart, nameLen, nameWord0, nameWord1, lastNameWord)) {
                     observe(temperature);
                     break;
                 }
@@ -386,19 +397,19 @@ public class CalculateAverage_mtopolnik {
                     tableIndex = (tableIndex + 1) & TABLE_INDEX_MASK;
                     continue;
                 }
-                initialize(hash, nameLen, nameStartAddress, temperature);
+                initialize(hash, nameLen, input, nameStart, temperature);
                 break;
             }
         }
 
-        void initialize(long hash, long nameLen, long nameStartAddress, int temperature) {
+        void initialize(long hash, long nameLen, MemorySegment input, long nameStart, int temperature) {
             setHash(hash);
             setNameLen((int) nameLen);
             setSum(temperature);
             setCount(1);
             setMin((short) temperature);
             setMax((short) temperature);
-            UNSAFE.copyMemory(nameStartAddress, nameAddress(), nameLen);
+            MemorySegment.copy(input, BYTE, nameStart, table, nameOffset(), (int) nameLen);
         }
 
         void observe(int temperature) {
@@ -408,20 +419,27 @@ public class CalculateAverage_mtopolnik {
             setMax((short) Integer.max(max(), temperature));
         }
 
-        private static boolean nameEquals(
-                                          long statsAddr, long inputAddr, long len, long inputWord1, long inputWord2, long lastInputWord) {
-            boolean mismatch1 = inputWord1 != UNSAFE.getLong(statsAddr);
-            boolean mismatch2 = inputWord2 != UNSAFE.getLong(statsAddr + Long.BYTES);
+        private boolean nameEquals(
+                                   MemorySegment input, long inputOff, long len, long inputWord1, long inputWord2,
+                                   long lastInputWord) {
+            final int statsOff = nameOffset();
+            boolean mismatch1 = inputWord1 != (long) LONG_VH.get(table, statsOff);
+            boolean mismatch2 = inputWord2 != (long) LONG_VH.get(table, statsOff + Long.BYTES);
+            // Fix: the original only consulted these for names up to 16 bytes, so longer names
+            // that differed within bytes 8..15 (and nowhere else) were wrongly treated as equal.
+            if (mismatch1 | mismatch2) {
+                return false;
+            }
             if (len <= 2 * Long.BYTES) {
-                return !(mismatch1 | mismatch2);
+                return true;
             }
             int i = 2 * Long.BYTES;
             for (; i <= len - Long.BYTES; i += Long.BYTES) {
-                if (UNSAFE.getLong(inputAddr + i) != UNSAFE.getLong(statsAddr + i)) {
+                if (input.get(LONG, inputOff + i) != (long) LONG_VH.get(table, statsOff + i)) {
                     return false;
                 }
             }
-            return i == len || lastInputWord == UNSAFE.getLong(statsAddr + i);
+            return i == len || lastInputWord == (long) LONG_VH.get(table, statsOff + i);
         }
     }
 
@@ -447,10 +465,12 @@ public class CalculateAverage_mtopolnik {
                 }
             }
             if (exhaustedCount == cursors.length) {
-                if (!onFirst) {
-                    System.out.print(", ");
+                if (curr != null) {
+                    if (!onFirst) {
+                        System.out.print(", ");
+                    }
+                    System.out.print(curr);
                 }
-                System.out.print(curr);
                 break;
             }
             cursors[indexOfMin]++;
@@ -495,15 +515,13 @@ public class CalculateAverage_mtopolnik {
         }
 
         @Override
+        public int hashCode() {
+            return name.hashCode();
+        }
+
+        @Override
         public int compareTo(StationStats that) {
             return name.compareTo(that.name);
         }
-    }
-
-    private static String longToString(long word) {
-        final ByteBuffer buf = ByteBuffer.allocate(8).order(ByteOrder.nativeOrder());
-        buf.clear();
-        buf.putLong(word);
-        return new String(buf.array(), StandardCharsets.UTF_8);
     }
 }

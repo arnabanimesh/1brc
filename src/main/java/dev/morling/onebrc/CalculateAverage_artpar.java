@@ -15,16 +15,13 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
-import java.nio.ByteBuffer;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -43,11 +40,8 @@ public class CalculateAverage_artpar {
     public static final int N_THREADS = 8;
     private static final String FILE = "./measurements.txt";
     private static final int INT_MAP_SIZE = 8192; // from calculateIntegerByteMapTest()
+    private static final int MAX_NAME_BYTES = 128; // station names are at most 100 bytes
     final static int[] byteHashMapToInt = calculateIntegerByteMap();
-    private static final Unsafe UNSAFE = initUnsafe();
-    // private static final VectorSpecies<Integer> SPECIES = IntVector.SPECIES_PREFERRED;
-    // final int VECTOR_SIZE = 512;
-    // final int VECTOR_SIZE_1 = VECTOR_SIZE - 1;
     final int AVERAGE_CHUNK_SIZE = 1024 * 64;
     final int AVERAGE_CHUNK_SIZE_1 = AVERAGE_CHUNK_SIZE - 1;
 
@@ -89,9 +83,6 @@ public class CalculateAverage_artpar {
                 throw new RuntimeException();
             }
 
-            // MappedByteBuffer mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, chunkStartPosition,
-            // chunkSize);
-
             ReaderRunnable readerRunnable = new ReaderRunnable(chunkStartPosition, chunkSize, fileChannel);
             Future<Map<String, MeasurementAggregator>> future = threadPool.submit(readerRunnable::run);
             // System.out.println("Added future [" + chunkStartPosition + "][" + chunkSize + "]");
@@ -101,7 +92,7 @@ public class CalculateAverage_artpar {
 
         fis.close();
 
-        Map<String, MeasurementAggregator> globalMap = futures.parallelStream().flatMap(future -> {
+        Map<String, MeasurementAggregator> globalMap = futures.stream().flatMap(future -> {
             try {
                 return future.get().entrySet().stream();
             }
@@ -154,13 +145,8 @@ public class CalculateAverage_artpar {
             for (int i = -999; i < 1000; i++) {
                 int hashCode = hashInteger(i);
 
-                // String s = new String(value);
                 int position = hashCode & (length - 1);
-                // System.out.printf("%.1f => %s length [%d] hash [%d] => %d\n", number, s, s.length(), hashCode, position);
                 if (byteHashToInt.containsKey(hashCode) || intToIntMap[position] != 0) {
-                    // System.err.println("HashClash [" + hashCode + "] -> " +
-                    // byteHashToInt.get(
-                    // hashCode) + " vs " + number + " == [" + position + "] =>" + intToIntMap[position]);
                     hasHashClash = true;
                     break;
                 }
@@ -172,7 +158,6 @@ public class CalculateAverage_artpar {
             if (!hasHashClash) {
                 // 8192
                 System.out.println("NoHash clash at [" + length + "]");
-                // throw new RuntimeException("clash");
                 return intToIntMap;
             }
 
@@ -194,7 +179,6 @@ public class CalculateAverage_artpar {
     }
 
     public static int[] calculateIntegerByteMap() {
-        long start = System.currentTimeMillis();
         int[] intToIntMap = new int[INT_MAP_SIZE];
         for (int i = -999; i < 1000; i++) {
             float number = i / 10f;
@@ -207,36 +191,11 @@ public class CalculateAverage_artpar {
             int position = hashCode & (INT_MAP_SIZE - 1);
             intToIntMap[position] = i;
         }
-        long end = System.currentTimeMillis();
-        // System.out.println("calculateIntegerByteMap " + (end - start) + " ms");
         return intToIntMap;
     }
 
     public static void main(String[] args) throws IOException {
         new CalculateAverage_artpar();
-    }
-
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    static boolean unsafeEquals(long aStart, long aLength, long bStart, long bLength) {
-        if (aLength != bLength) {
-            return false;
-        }
-        for (int i = 0; i < aLength; ++i) {
-            if (UNSAFE.getByte(aStart + i) != UNSAFE.getByte(bStart + i)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     private record ResultRow(double min, double mean, double max) {
@@ -283,11 +242,11 @@ public class CalculateAverage_artpar {
 
     static class StationName {
         public final int hash;
-        private final ByteBuffer nameBytes;
+        private final byte[] nameBytes;
         private final MeasurementAggregator measurementAggregator = new MeasurementAggregator();
         public int count = 0;
 
-        public StationName(ByteBuffer nameBytes, int hash) {
+        public StationName(byte[] nameBytes, int hash) {
             this.nameBytes = nameBytes;
             this.hash = hash;
         }
@@ -304,46 +263,49 @@ public class CalculateAverage_artpar {
             this.chunkSize = chunkSize;
             this.startPosition = startPosition;
             this.fileChannel = fileChannel;
-            // mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startPosition, chunkSize);
         }
 
         public Map<String, MeasurementAggregator> run() throws IOException {
-            MemorySegment mappedSegment = fileChannel.map(FileChannel.MapMode.READ_ONLY,
-                    startPosition, chunkSize, Arena.global());
+            // Heap scratch buffer for the current station name (replaces Unsafe.allocateMemory)
+            byte[] nameBuffer = new byte[MAX_NAME_BYTES];
+            int nameLength = 0;
 
-            long rawBufferAddress = UNSAFE.allocateMemory(100);
-            int rawBufferReadIndex = 0;
-            long position = mappedSegment.address();
-            long endPosition = position + chunkSize;
-            byte b;
-            int hash;
-            int nameHash;
+            // A confined arena unmaps the chunk as soon as we are done with it, instead of
+            // keeping every mapping alive until the JVM exits (as Arena.global() did).
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment segment = fileChannel.map(FileChannel.MapMode.READ_ONLY,
+                        startPosition, chunkSize, arena);
 
-            hash = 1;
+                long position = 0;
+                long endPosition = chunkSize;
+                byte b;
+                int hash = 1;
+                int nameHash;
 
-            while (position < endPosition) {
+                while (position < endPosition) {
 
-                while ((position < endPosition) &&
-                        (b = UNSAFE.getByte(position++)) != ';') {
-                    UNSAFE.putByte(rawBufferAddress + rawBufferReadIndex++, b);
-                    hash = hash * 31 + b;
+                    while ((position < endPosition) &&
+                            (b = segment.get(ValueLayout.JAVA_BYTE, position++)) != ';') {
+                        nameBuffer[nameLength++] = b;
+                        hash = hash * 31 + b;
+                    }
+
+                    nameHash = hash;
+                    hash = 1;
+
+                    while ((position < endPosition) &&
+                            (b = segment.get(ValueLayout.JAVA_BYTE, position++)) != '\n') {
+                        hash = hash * 31 + b;
+                    }
+                    stationNameMap.getOrCreate(nameBuffer, nameLength,
+                            byteHashMapToInt[hash & (INT_MAP_SIZE - 1)], nameHash);
+                    nameLength = 0;
+                    hash = 1;
+
                 }
-
-                nameHash = hash;
-                hash = 1;
-
-                while ((position < endPosition) &&
-                        (b = UNSAFE.getByte(position++)) != '\n') {
-                    hash = hash * 31 + b;
-                }
-                stationNameMap.getOrCreate(rawBufferAddress, rawBufferReadIndex,
-                        byteHashMapToInt[hash & (INT_MAP_SIZE - 1)], nameHash);
-                rawBufferReadIndex = 0;
-                hash = 1;
-
             }
-            return Arrays.stream(stationNameMap.names).parallel().filter(Objects::nonNull).collect(
-                    Collectors.toMap(e -> StandardCharsets.UTF_8.decode(e.nameBytes).toString(),
+            return Arrays.stream(stationNameMap.names).filter(Objects::nonNull).collect(
+                    Collectors.toMap(e -> new String(e.nameBytes, StandardCharsets.UTF_8),
                             e -> e.measurementAggregator, MeasurementAggregator::combine));
         }
     }
@@ -352,10 +314,8 @@ public class CalculateAverage_artpar {
         int[] indexes = new int[AVERAGE_CHUNK_SIZE];
         StationName[] names = new StationName[AVERAGE_CHUNK_SIZE];
         int currentIndex = 0;
-        ByteBuffer bytesForName = ByteBuffer.allocateDirect(1000 * 100);
-        int nameBufferIndex = 0;
 
-        public void getOrCreate(long stationNameBytesAddress, int length, int doubleValue, int hash) {
+        public void getOrCreate(byte[] stationNameBytes, int length, int doubleValue, int hash) {
             int position = hash & AVERAGE_CHUNK_SIZE_1;
             while (indexes[position] != 0 && (names[indexes[position]].hash != hash)) {
                 position = ++position & AVERAGE_CHUNK_SIZE_1;
@@ -365,13 +325,7 @@ public class CalculateAverage_artpar {
                 stationName.measurementAggregator.combine(doubleValue);
             }
             else {
-                ByteBuffer nameSlice = bytesForName.slice(nameBufferIndex, length);
-                nameBufferIndex += length;
-                for (int i = 0; i < length; i++) {
-                    nameSlice.put(UNSAFE.getByte(stationNameBytesAddress + i));
-                }
-                nameSlice.flip();
-                StationName stationName = new StationName(nameSlice, hash);
+                StationName stationName = new StationName(Arrays.copyOf(stationNameBytes, length), hash);
                 indexes[position] = ++currentIndex;
                 names[indexes[position]] = stationName;
                 stationName.measurementAggregator.combine(doubleValue);

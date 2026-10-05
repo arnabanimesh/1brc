@@ -18,20 +18,26 @@ package dev.morling.onebrc;
 import jdk.incubator.vector.ShortVector;
 import jdk.incubator.vector.VectorOperators;
 
-import sun.misc.Unsafe;
-import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
-
 import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 
 /**
+ * Java 27 compatible version.
+ *
+ * Build / run (the Vector API is still an incubator module):
+ *   javac --add-modules jdk.incubator.vector CalculateAverage_flippingbits.java
+ *   java  --add-modules jdk.incubator.vector dev.morling.onebrc.CalculateAverage_flippingbits
+ *
  * Approach:
- * - Use memory-mapped file to speed up loading data into memory
- * - Partition data, compute aggregates for partitions in parallel, and finally combine results from all partitions
+ * - Use a memory-mapped file (FFM API MemorySegment, no sun.misc.Unsafe)
+ * - Partition data, compute aggregates for partitions in parallel, and finally combine results
  * - Apply SIMD instructions for computing min/max/sum aggregates
  * - Use Shorts for storing aggregates of partitions, so we maximize the SIMD parallelism
  */
@@ -45,33 +51,20 @@ public class CalculateAverage_flippingbits {
 
     private static final int NUM_STATIONS = 10_000;
 
-    private static final int HASH_MAP_OFFSET_CAPACITY = 200_000;
+    // Must be a power of two (probing uses a bit mask)
+    private static final int HASH_MAP_OFFSET_CAPACITY = 1 << 18;
 
-    private static final Unsafe UNSAFE = initUnsafe();
+    private static final int HASH_PRIME_NUMBER = 31;
 
-    private static int HASH_PRIME_NUMBER = 31;
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
 
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    // The mapped file; assigned once in getSegments() before any worker thread starts
+    private static MemorySegment data;
 
     public static void main(String[] args) throws IOException {
         var result = Arrays.asList(getSegments()).parallelStream()
-                .map(segment -> {
-                    try {
-                        return processSegment(segment[0], segment[1]);
-                    }
-                    catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                })
+                .map(segment -> processSegment(segment[0], segment[1]))
                 .reduce(FasterHashMap::mergeWith)
                 .get();
 
@@ -83,84 +76,78 @@ public class CalculateAverage_flippingbits {
         System.out.println(sortedMap);
     }
 
+    /** Returns [startOffset, endOffset) pairs relative to the start of the mapped file. */
     private static long[][] getSegments() throws IOException {
-        try (var file = new RandomAccessFile(FILE, "r")) {
-            var channel = file.getChannel();
-
+        try (var channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
             var fileSize = channel.size();
-            var startAddress = channel
-                    .map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global())
-                    .address();
+            data = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
 
-            // Split file into segments, so we can work around the size limitation of channels
             var numSegments = (fileSize > MINIMUM_FILE_SIZE_PARTITIONING)
                     ? Runtime.getRuntime().availableProcessors()
                     : 1;
             var segmentSize = fileSize / numSegments;
 
             var boundaries = new long[numSegments][2];
-            var endPointer = startAddress;
+            long end = 0;
 
             for (var i = 0; i < numSegments - 1; i++) {
-                // Start of segment
-                boundaries[i][0] = endPointer;
+                boundaries[i][0] = end;
 
-                // Extend segment until end of line or file
-                endPointer = endPointer + segmentSize;
-                while (UNSAFE.getByte(endPointer) != '\n') {
-                    endPointer++;
+                // Extend segment until end of line
+                end = end + segmentSize;
+                while (data.get(BYTE, end) != '\n') {
+                    end++;
                 }
 
-                // End of segment
-                boundaries[i][1] = endPointer++;
+                boundaries[i][1] = end++;
             }
 
-            boundaries[numSegments - 1][0] = endPointer;
-            boundaries[numSegments - 1][1] = startAddress + fileSize;
+            boundaries[numSegments - 1][0] = end;
+            boundaries[numSegments - 1][1] = fileSize;
 
             return boundaries;
         }
     }
 
-    private static FasterHashMap processSegment(long startOfSegment, long endOfSegment) throws IOException {
+    private static FasterHashMap processSegment(long startOfSegment, long endOfSegment) {
         var fasterHashMap = new FasterHashMap();
         for (var i = startOfSegment; i < endOfSegment; i += 3) {
             // Read station name
-            int nameHash = UNSAFE.getByte(i);
-            final var nameStartAddress = i++;
-            var character = UNSAFE.getByte(i);
+            int nameHash = data.get(BYTE, i);
+            final var nameStart = i++;
+            var character = data.get(BYTE, i);
             while (character != ';') {
                 nameHash = nameHash * HASH_PRIME_NUMBER + character;
                 i++;
-                character = UNSAFE.getByte(i);
+                character = data.get(BYTE, i);
             }
-            var nameLength = (int) (i - nameStartAddress);
+            var nameLength = (int) (i - nameStart);
             i++;
 
             // Read measurement
-            var isNegative = UNSAFE.getByte(i) == '-';
+            var isNegative = data.get(BYTE, i) == '-';
             var measurement = 0;
             if (isNegative) {
                 i++;
-                character = UNSAFE.getByte(i);
+                character = data.get(BYTE, i);
                 while (character != '.') {
                     measurement = measurement * 10 + character - '0';
                     i++;
-                    character = UNSAFE.getByte(i);
+                    character = data.get(BYTE, i);
                 }
-                measurement = (measurement * 10 + UNSAFE.getByte(i + 1) - '0') * -1;
+                measurement = (measurement * 10 + data.get(BYTE, i + 1) - '0') * -1;
             }
             else {
-                character = UNSAFE.getByte(i);
+                character = data.get(BYTE, i);
                 while (character != '.') {
                     measurement = measurement * 10 + character - '0';
                     i++;
-                    character = UNSAFE.getByte(i);
+                    character = data.get(BYTE, i);
                 }
-                measurement = measurement * 10 + UNSAFE.getByte(i + 1) - '0';
+                measurement = measurement * 10 + data.get(BYTE, i + 1) - '0';
             }
 
-            fasterHashMap.addEntry(nameHash, nameLength, nameStartAddress, (short) measurement);
+            fasterHashMap.addEntry(nameHash, nameLength, nameStart, (short) measurement);
         }
 
         for (Station station : fasterHashMap.getEntries()) {
@@ -189,8 +176,7 @@ public class CalculateAverage_flippingbits {
         }
 
         public String getName() {
-            byte[] name = new byte[nameLength];
-            UNSAFE.copyMemory(null, nameAddress, name, Unsafe.ARRAY_BYTE_BASE_OFFSET, nameLength);
+            byte[] name = data.asSlice(nameAddress, nameLength).toArray(BYTE);
             return new String(name, StandardCharsets.UTF_8);
         }
 
@@ -234,12 +220,12 @@ public class CalculateAverage_flippingbits {
             var swarLimit = (nameLength / Long.BYTES) * Long.BYTES;
             var i = 0;
             for (; i < swarLimit; i += Long.BYTES) {
-                if (UNSAFE.getLong(nameAddress + i) != UNSAFE.getLong(otherNameAddress + i)) {
+                if (data.get(LONG, nameAddress + i) != data.get(LONG, otherNameAddress + i)) {
                     return false;
                 }
             }
             for (; i < nameLength; i++) {
-                if (UNSAFE.getByte(nameAddress + i) != UNSAFE.getByte(otherNameAddress + i)) {
+                if (data.get(BYTE, nameAddress + i) != data.get(BYTE, otherNameAddress + i)) {
                     return false;
                 }
             }
@@ -271,12 +257,13 @@ public class CalculateAverage_flippingbits {
         int slotsInUse = 0;
 
         private int getOffsetIdx(int nameHash, int nameLength, long nameAddress) {
-            var offsetIdx = nameHash & (offsets.length - 1);
+            final int mask = offsets.length - 1;
+            var offsetIdx = nameHash & mask;
             var offset = offsets[offsetIdx];
 
             while (offset != 0 &&
                     (nameLength != entries[offset].nameLength || !entries[offset].nameEquals(nameAddress))) {
-                offsetIdx = (offsetIdx + 1) % offsets.length;
+                offsetIdx = (offsetIdx + 1) & mask;
                 offset = offsets[offsetIdx];
             }
 

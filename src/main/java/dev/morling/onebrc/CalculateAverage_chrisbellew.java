@@ -18,7 +18,6 @@ package dev.morling.onebrc;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.lang.reflect.Field;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.HashMap;
@@ -27,17 +26,15 @@ import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
-import sun.misc.Unsafe;
 
 /**
- * This is Chris Bellew's implementation. Here are the key points:
- * 
+ * This is Chris Bellew's implementation, updated to run on JDK 27. Here are the key points:
+ *
  * - The file is equally split into ranges, one range per thread.
- *   18 threads was experimentally found to be optimal.
- * 
+ *
  * - Each thread memory maps the file range it is responsible for and
  *   then iterates through the range, one smaller buffer at a time.
- * 
+ *
  * - The contents are parsed by using SIMD vector equality comparisons
  *   between the source data and the newline character, effectively
  *   delimiting each line. The measurement of each line is discovered
@@ -46,7 +43,7 @@ import sun.misc.Unsafe;
  *   but is used because integer parsing was found to be much faster
  *   than floating point parsing, and it's also immune to floating
  *   point arithmetic errors when aggregating the measurements later.
- * 
+ *
  * - Once the name and the measurement is parsed for a line, the name
  *   is hashed and used a lookup into a hash table. The value of the
  *   hash table at the given slot is an index into another array, this
@@ -58,12 +55,27 @@ import sun.misc.Unsafe;
  *   the hash table slots to have a fixed size, while allowing the city
  *   names to be arbitrarily long. The hash table can then use open
  *   addressing to resolve collisions and remain efficient for lookups.
- * 
+ *
  * - After the range has been processed, the results are collected by
  *   iterating through the hash table and looking up the corresponding
  *   integer table for each slot then collecting the min, max, count
  *   and sum of the measurements for each city. Then the results are
  *   combined from all threads, using a treemap for sorting, and printed.
+ *
+ * JDK 27 notes:
+ *
+ * - sun.misc.Unsafe is no longer used. Its memory-access methods are
+ *   deprecated for removal (JEP 471), warn at runtime since JDK 24
+ *   (JEP 498), and are scheduled to throw by default from JDK 26 and be
+ *   removed from JDK 28. The hash table, name lengths and numbers table are
+ *   now plain per-thread arrays, which are zero-initialised by the JVM
+ *   and garbage collected (the old allocateMemory calls were never freed).
+ *
+ * - The Vector API is still an incubator module, so both compiling and
+ *   running need: --add-modules jdk.incubator.vector
+ *
+ *   javac --add-modules jdk.incubator.vector CalculateAverage_chrisbellew.java
+ *   java  --add-modules jdk.incubator.vector dev.morling.onebrc.CalculateAverage_chrisbellew
  */
 public final class CalculateAverage_chrisbellew {
     public static final long FILE_SIZE = getFileSize();
@@ -201,13 +213,6 @@ public final class CalculateAverage_chrisbellew {
         private static final VectorMask<Byte>[] MASKS = generateMasks(SPECIES);
 
         /**
-         * The unsafe instance is used to allocate memory for the hash table slots
-         * and integer table slots. It skips the JVM's garbage collector and allows
-         * the memory to be accessed directly without overhead such as bounds checks.
-         */
-        private static final Unsafe unsafe = getUnsafe();
-
-        /**
          * The start and end positions this thread will iterate through.
          */
         private final long start;
@@ -216,19 +221,23 @@ public final class CalculateAverage_chrisbellew {
         private final int bufferSize;
 
         /**
-         * The main memory address at the beginning of the hash table slots.
+         * The hash table. Each entry is the index into the vectors array where the
+         * slot's name vectors begin, or 0 if the slot is empty (which is why the
+         * first vector index is 8 rather than 0). This was previously a short
+         * array in native memory, which would overflow once the vector index passed
+         * 32767, so it is an int array now.
          */
-        private final long slotsAddress;
+        private final int[] slots = new int[NUM_SLOTS];
 
         /**
-         * The main memory address at the beginning of the integer table slots.
+         * The length in bytes of the city name stored in each slot.
          */
-        private final long numbersAddress;
+        private final byte[] lengths = new byte[NUM_SLOTS];
 
         /**
-         * The main memory address at the beginning of the name length table slots.
+         * The aggregations for each slot, four ints per slot: min, max, count, sum.
          */
-        private final long lengthsAddress;
+        private final int[] numbers = new int[NUM_SLOTS * 4];
 
         /**
          * The SIMD vectors associated with each slot in the hash table. The
@@ -236,13 +245,13 @@ public final class CalculateAverage_chrisbellew {
          * The intent of having this array as an extra lookup is to allow N
          * vectors per slot while having fixed size slots.
          */
-        private ByteVector[] vectors = new ByteVector[200000];
-        private String[] cityNames = new String[NUM_SLOTS];
+        private final ByteVector[] vectors = new ByteVector[200000];
+        private final String[] cityNames = new String[NUM_SLOTS];
 
         /**
          * The next available index in the vectors array.
          */
-        private short nextVectorIndex = 8;
+        private int nextVectorIndex = 8;
 
         /**
          * A map of city name strings to their corresponding slot index in the
@@ -256,18 +265,6 @@ public final class CalculateAverage_chrisbellew {
             this.start = start;
             this.end = end;
             this.bufferSize = bufferSize;
-
-            /**
-             * Allocate memory for the hash table and the integer table.
-             * Initialise the hash table slots to 0, so we can use 0 to
-             * indicate an empty slot.
-             */
-            slotsAddress = unsafe.allocateMemory(NUM_SLOTS * 2);
-            for (int i = 0; i < NUM_SLOTS; i++) {
-                unsafe.putShort(slotsAddress + i * 2, (short) 0);
-            }
-            numbersAddress = unsafe.allocateMemory(NUM_SLOTS * 16);
-            lengthsAddress = unsafe.allocateMemory(NUM_SLOTS);
         }
 
         public final void run() {
@@ -294,7 +291,7 @@ public final class CalculateAverage_chrisbellew {
         /**
          * Iterates through the entire memory mapped range, one buffer at a time.
          * The buffers are made to overlap to allow each buffer to peek into the next
-         * range to complete the last line. 
+         * range to complete the last line.
          */
         private final void processRange(MappedByteBuffer buffer, boolean lastRange) {
             byte[] buf = new byte[bufferSize];
@@ -328,7 +325,7 @@ public final class CalculateAverage_chrisbellew {
 
             /**
              * Skip past any characters before the first newline because the previous
-             * segment will have already processed them. That is unless this if the 
+             * segment will have already processed them. That is unless this if the
              * first buffer in the first range (global position zero), in which case
              * we will start from the first character.
              */
@@ -366,7 +363,7 @@ public final class CalculateAverage_chrisbellew {
                 nameStart = index;
 
                 /**
-                 * If this is the last buffer in the last range then we want to 
+                 * If this is the last buffer in the last range then we want to
                  * process every character until the very end of the file.
                  */
                 if (lastRange && lastBuffer) {
@@ -418,11 +415,11 @@ public final class CalculateAverage_chrisbellew {
         /**
          * Given the index in the buffer of where a name starts, and the index of
          * the next newline, creeps back from the next newline to find the structure
-         * of the measurement, parsing it into a number as it goes. It is parsed 
+         * of the measurement, parsing it into a number as it goes. It is parsed
          * into an integer because it's faster than parsing as a float, and it's also
          * immune to floating point arithmetic errors when aggregating the measurements
          * later.
-         * 
+         *
          * Then proceeds to record the fully parsed name and measurement in the hash table.
          */
         private final void slice(byte[] buffer, int newlineIndex, int nameStart) {
@@ -484,7 +481,7 @@ public final class CalculateAverage_chrisbellew {
              * Identify if the slot is occupied, then check the equality of the
              * slot with the city name.
              */
-            var vectorOffset = unsafe.getShort(slotsAddress + slotIndex * 2);
+            var vectorOffset = slots[slotIndex];
             while (vectorOffset != 0) {
 
                 /**
@@ -497,7 +494,7 @@ public final class CalculateAverage_chrisbellew {
                      * check is needed because the vector equality check can give
                      * false positives if one city name starts with another.
                      */
-                    byte slotNameLength = unsafe.getByte(lengthsAddress + slotIndex);
+                    byte slotNameLength = lengths[slotIndex];
                     if (slotNameLength == nameLength) {
                         updateSlot(slotIndex, measurement);
                         break;
@@ -509,7 +506,7 @@ public final class CalculateAverage_chrisbellew {
                  * we try the next slot in the hash table through linear probing.
                  */
                 slotIndex = (slotIndex + 1) % NUM_SLOTS;
-                vectorOffset = unsafe.getShort(slotsAddress + slotIndex * 2);
+                vectorOffset = slots[slotIndex];
             }
 
             /**
@@ -518,14 +515,14 @@ public final class CalculateAverage_chrisbellew {
              */
             if (vectorOffset == 0) {
                 /**
-                 * Record where the city name length is recorded for this slot.
+                 * Record the length of the city name for this slot.
                  */
-                unsafe.putByte(lengthsAddress + slotIndex, (byte) nameLength);
+                lengths[slotIndex] = (byte) nameLength;
 
                 /**
-                 * Record where the start of the set of vectors are recorded for
+                 * Record where the start of the set of vectors for this slot is.
                  */
-                unsafe.putShort(slotsAddress + slotIndex * 2, nextVectorIndex);
+                slots[slotIndex] = nextVectorIndex;
 
                 /**
                  * Records the vectors for the city name.
@@ -541,10 +538,10 @@ public final class CalculateAverage_chrisbellew {
                  * Min, max, count, sum
                  */
                 var numbersIndex = getNumbersIndex(slotIndex);
-                unsafe.putInt(numbersIndex, measurement);
-                unsafe.putInt(numbersIndex + 4, measurement);
-                unsafe.putInt(numbersIndex + 8, 1);
-                unsafe.putInt(numbersIndex + 12, measurement);
+                numbers[numbersIndex] = measurement;
+                numbers[numbersIndex + 1] = measurement;
+                numbers[numbersIndex + 2] = 1;
+                numbers[numbersIndex + 3] = measurement;
 
                 cityNames[slotIndex] = new String(buffer, nameStart, nameLength);
             }
@@ -595,7 +592,12 @@ public final class CalculateAverage_chrisbellew {
                     }
                 }
             }
-            return Math.abs(integer) % NUM_SLOTS;
+            /**
+             * Math.abs(Integer.MIN_VALUE) is still negative, which would give a
+             * negative array index, so flip the sign of that one case.
+             */
+            var slot = Math.abs(integer) % NUM_SLOTS;
+            return slot < 0 ? -slot : slot;
         }
 
         /**
@@ -604,21 +606,16 @@ public final class CalculateAverage_chrisbellew {
          */
         private final void updateSlot(int slotIndex, int measurement) {
             var numbersIndex = getNumbersIndex(slotIndex);
-            var min = unsafe.getInt(numbersIndex);
-            var max = unsafe.getInt(numbersIndex + 4);
-            var count = unsafe.getInt(numbersIndex + 8);
-            var sum = unsafe.getInt(numbersIndex + 12);
-
-            unsafe.putInt(numbersIndex, Math.min(min, measurement));
-            unsafe.putInt(numbersIndex + 4, Math.max(max, measurement));
-            unsafe.putInt(numbersIndex + 8, count + 1);
-            unsafe.putInt(numbersIndex + 12, sum + measurement);
+            numbers[numbersIndex] = Math.min(numbers[numbersIndex], measurement);
+            numbers[numbersIndex + 1] = Math.max(numbers[numbersIndex + 1], measurement);
+            numbers[numbersIndex + 2]++;
+            numbers[numbersIndex + 3] += measurement;
         }
 
         /**
          * Given a name in a buffer, a slot index, and a number of vectors, checks
          * the equality of the name and the slot.
-         * 
+         *
          * The length of the name is not necessarily a multiple of the SIMD vector
          * length, so the last vector in the slot will be a partial vector. The
          * masks are used to ignore the unused bytes in the last vector.
@@ -652,11 +649,11 @@ public final class CalculateAverage_chrisbellew {
         }
 
         /**
-         * Given a slot index, returns the main memory address of the integer table
-         * where the min, max, count and sum of the measurements are stored.
+         * Given a slot index, returns the index into the numbers array where the
+         * min, max, count and sum of the measurements for that slot are stored.
          */
-        private final long getNumbersIndex(int slotIndex) {
-            return numbersAddress + slotIndex * 16;
+        private final int getNumbersIndex(int slotIndex) {
+            return slotIndex * 4;
         }
 
         public void collectResults(TreeMap<String, CityResult> results) {
@@ -664,10 +661,10 @@ public final class CalculateAverage_chrisbellew {
                 var city = entry.getKey();
                 var slotIndex = entry.getValue();
                 var numbersIndex = getNumbersIndex(slotIndex);
-                var min = unsafe.getInt(numbersIndex);
-                var max = unsafe.getInt(numbersIndex + 4);
-                var count = unsafe.getInt(numbersIndex + 8);
-                var sum = unsafe.getInt(numbersIndex + 12);
+                var min = numbers[numbersIndex];
+                var max = numbers[numbersIndex + 1];
+                var count = numbers[numbersIndex + 2];
+                var sum = numbers[numbersIndex + 3];
                 results.compute(city, (k, v) -> {
                     if (v == null) {
                         return new CityResult(min, max, sum, count);
@@ -687,6 +684,7 @@ public final class CalculateAverage_chrisbellew {
          * Generates a lookup table of vector masks to use when comparing equality of
          * the last vector of the source line and a given slot in the hash table.
          */
+        @SuppressWarnings("unchecked")
         private static final VectorMask<Byte>[] generateMasks(VectorSpecies<Byte> species) {
             VectorMask<Byte>[] masks = new VectorMask[species.length() - 1];
             masks[0] = VectorMask.fromArray(species, new boolean[]{ true, false, false, false, false, false, false, false }, 0);
@@ -697,18 +695,6 @@ public final class CalculateAverage_chrisbellew {
             masks[5] = VectorMask.fromArray(species, new boolean[]{ true, true, true, true, true, true, false, false }, 0);
             masks[6] = VectorMask.fromArray(species, new boolean[]{ true, true, true, true, true, true, true, false }, 0);
             return masks;
-        }
-
-        private static final Unsafe getUnsafe() {
-            Field field;
-            try {
-                field = Unsafe.class.getDeclaredField("theUnsafe");
-                field.setAccessible(true);
-                return (Unsafe) field.get(null);
-            }
-            catch (NoSuchFieldException | SecurityException | IllegalArgumentException | IllegalAccessException e) {
-                throw new RuntimeException("Failed to get unsafe", e);
-            }
         }
     }
 

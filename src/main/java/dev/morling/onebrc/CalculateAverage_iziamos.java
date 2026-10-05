@@ -15,13 +15,14 @@
  */
 package dev.morling.onebrc;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
@@ -30,132 +31,157 @@ import static java.nio.channels.FileChannel.MapMode.READ_ONLY;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.nio.file.StandardOpenOption.READ;
 
+/**
+ * Same algorithm as the original, but with sun.misc.Unsafe replaced by the
+ * Foreign Function & Memory API (java.lang.foreign, final since JDK 22).
+ * <p>
+ * Nothing here needs --add-opens, --sun-misc-unsafe-memory-access or
+ * --enable-native-access: no restricted methods are used.
+ * <p>
+ * All "addresses" are now byte offsets into the mapped file segment.
+ */
 public class CalculateAverage_iziamos {
-    private static final sun.misc.Unsafe UNSAFE = initUnsafe();
-
-    private static sun.misc.Unsafe initUnsafe() {
-        try {
-            java.lang.reflect.Field theUnsafe = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (sun.misc.Unsafe) theUnsafe.get(sun.misc.Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     private static final String FILE = "./measurements.txt";
-    private static final Arena GLOBAL_ARENA = Arena.global();
+
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT;
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG;
+    /** Unaligned, always little-endian 8-byte read (a plain load on x86/ARM64). */
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     public static void main(String[] args) throws Exception {
-        // final long chunkSize = Long.MAX_VALUE;
-        final long chunkSize = 64 * 1024 * 1024;
+        final long chunkSize = 64L * 1024 * 1024;
 
-        final FileChannel fileChannel;
-        try {
-            fileChannel = (FileChannel) Files.newByteChannel(Path.of(FILE), READ);
-        }
-        catch (final IOException e) {
-            throw new UncheckedIOException(e);
+        final MemorySegment file;
+        try (FileChannel channel = FileChannel.open(Path.of(FILE), READ)) {
+            // The mapping outlives the channel; it lives as long as the global arena.
+            file = channel.map(READ_ONLY, 0, channel.size(), Arena.global());
         }
 
-        final var seg = fileChannel.map(READ_ONLY, 0, fileChannel.size(), GLOBAL_ARENA);
-
-        final long fileSize = seg.byteSize();
-        final long threadCount = 1 + fileSize / chunkSize;
-
-        final var processingFutures = new CompletableFuture[(int) threadCount];
-        for (int i = 0; i < threadCount; ++i) {
-            processingFutures[i] = processSegment(seg.address(), seg.address() + fileSize, i, chunkSize);
+        final long fileSize = file.byteSize();
+        if (fileSize == 0) {
+            System.out.println("{}");
+            return;
         }
 
-        final long aggregate = (long) processingFutures[0].get();
-        for (int i = 1; i < processingFutures.length; i++) {
-            final long r = (long) processingFutures[i].get();
-            ByteBackedResultSet.merge(aggregate, r);
+        final int chunkCount = (int) ((fileSize + chunkSize - 1) / chunkSize);
+        final List<CompletableFuture<ResultTable>> futures = new ArrayList<>(chunkCount);
+        for (int i = 0; i < chunkCount; ++i) {
+            futures.add(processChunk(file, i, chunkSize));
         }
 
+        // Merge chunks in order as they finish and free each table right after,
+        // so at most a handful of 4 MB tables are alive at any time.
         final Map<String, ResultRow> output = new TreeMap<>();
-        ByteBackedResultSet.forEach(aggregate,
-                (name, min, max, sum, count) -> output.put(name, new ResultRow(min, (double) sum / count, max)));
+        try (ResultTable aggregate = futures.get(0).get()) {
+            futures.set(0, null);
+            for (int i = 1; i < chunkCount; i++) {
+                try (ResultTable other = futures.get(i).get()) {
+                    aggregate.merge(other);
+                }
+                futures.set(i, null);
+            }
+
+            aggregate.forEach(
+                    (name, min, max, sum, count) -> output.put(name, new ResultRow(min, (double) sum / count, max)));
+        }
 
         System.out.println(output);
     }
 
     private record ResultRow(long min, double mean, long max) {
+        @Override
         public String toString() {
-            return "%s/{round(mean)}/{formatLong(max)}".formatted(formatLong(min));
+            return "%s/%s/%s".formatted(tenths(min), roundedTenths(mean), tenths(max));
         }
 
-        private double formatLong(final long value) {
+        private static double tenths(final long value) {
             return value / 10.0;
         }
 
-        private double round(double value) {
+        private static double roundedTenths(final double value) {
             return Math.round(value) / 10.0;
         }
     }
 
-    private static CompletableFuture<Long> processSegment(final long basePointer,
-                                                          final long endPointer,
-                                                          final long chunkNumber,
-                                                          final long chunkSize) {
-        final var ret = new CompletableFuture<Long>();
+    private static CompletableFuture<ResultTable> processChunk(final MemorySegment file,
+                                                               final long chunkNumber,
+                                                               final long chunkSize) {
+        final var ret = new CompletableFuture<ResultTable>();
 
         Thread.ofVirtual().start(() -> {
-            final long relativeStart = chunkNumber * chunkSize;
-            final long absoluteStart = basePointer + relativeStart;
+            try {
+                final long fileSize = file.byteSize();
+                final long chunkStart = chunkNumber * chunkSize;
+                final long chunkEnd = Math.min(chunkStart + chunkSize, fileSize);
+                final long start = skipIncomplete(file, chunkStart);
 
-            final long absoluteEnd = computeAbsoluteEndWithSlack(absoluteStart + chunkSize, endPointer);
-            final long startOffsetAfterSkipping = skipIncomplete(basePointer, absoluteStart);
-
-            final long result = processEvents(startOffsetAfterSkipping, absoluteEnd);
-            ret.complete(result);
+                final ResultTable table = new ResultTable(file);
+                scalarLoop(file, start, chunkEnd, table);
+                ret.complete(table);
+            }
+            catch (final Throwable t) {
+                ret.completeExceptionally(t);
+            }
         });
 
         return ret;
     }
 
-    private static long computeAbsoluteEndWithSlack(final long chunk, final long endPointer) {
-        return Long.compareUnsigned(endPointer, chunk) > 0 ? chunk : endPointer;
-    }
-
-    private static long skipIncomplete(final long basePointer, final long start) {
-        if (start == basePointer) {
-            return start;
+    /**
+     * Returns the offset of the first line that starts at or after {@code start}.
+     * A line belongs to the chunk in which it *starts*, so we look at the byte
+     * before {@code start}: if it is '\n', {@code start} is already a line start.
+     */
+    private static long skipIncomplete(final MemorySegment file, final long start) {
+        if (start == 0) {
+            return 0;
         }
-        for (long i = 0;; ++i) {
-            final byte b = UNSAFE.getByte(start + i);
-            if (b == '\n') {
-                return start + i + 1;
+        final long size = file.byteSize();
+        for (long i = start - 1; i < size; ++i) {
+            if (file.get(BYTE, i) == '\n') {
+                return i + 1;
             }
         }
+        return size;
     }
 
-    private static long processEvents(final long start, final long limit) {
-        final long result = ByteBackedResultSet.createResultSet();
-        scalarLoop(start, limit, result);
-        return result;
-    }
-
-    private static void scalarLoop(final long start, final long limit, final long result) {
-        final LoopCursor cursor = new LoopCursor(start, limit);
+    private static void scalarLoop(final MemorySegment file, final long start, final long limit, final ResultTable result) {
+        final LoopCursor cursor = new LoopCursor(file, start, limit);
         while (cursor.hasMore()) {
-            final long address = cursor.getCurrentAddress();
+            final long nameOffset = cursor.getCurrentAddress();
             final int length = cursor.getStringLength();
             final int hash = cursor.getHash();
             final int value = cursor.getCurrentValue();
-            ByteBackedResultSet.put(result, address, length, hash, value);
+            result.put(nameOffset, length, hash, value);
         }
     }
 
+    /**
+     * 8-byte little-endian read at {@code offset}. Within 8 bytes of the end of the
+     * file a plain read would be out of bounds, so the missing bytes read as zero.
+     */
+    private static long readWord(final MemorySegment file, final long offset) {
+        final long size = file.byteSize();
+        if (offset <= size - Long.BYTES) {
+            return file.get(LONG_LE, offset);
+        }
+        long word = 0;
+        for (long i = 0; offset + i < size; ++i) {
+            word |= (file.get(BYTE, offset + i) & 0xFFL) << (8 * i);
+        }
+        return word;
+    }
+
     public static class LoopCursor {
-        private long pointer;
+        private final MemorySegment file;
         private final long limit;
+        private long pointer;
 
         private int hash = 0;
 
-        public LoopCursor(final long pointer, final long limit) {
+        public LoopCursor(final MemorySegment file, final long pointer, final long limit) {
+            this.file = file;
             this.pointer = pointer;
             this.limit = limit;
         }
@@ -168,8 +194,8 @@ public class CalculateAverage_iziamos {
             int strLen = 0;
             hash = 0;
 
-            byte b = UNSAFE.getByte(pointer);
-            for (; b != ';'; ++strLen, b = UNSAFE.getByte(pointer + strLen)) {
+            byte b = file.get(BYTE, pointer);
+            for (; b != ';'; ++strLen, b = file.get(BYTE, pointer + strLen)) {
                 hash = 31 * hash + b;
             }
             pointer += strLen + 1;
@@ -189,10 +215,7 @@ public class CalculateAverage_iziamos {
          * No point rewriting what would essentially be the same code <3.
          */
         public int getCurrentValueMeryKitty() {
-            long word = UNSAFE.getLong(pointer);
-            if (ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN) {
-                word = Long.reverseBytes(word);
-            }
+            final long word = readWord(file, pointer); // always little-endian
 
             int decimalSepPos = Long.numberOfTrailingZeros(~word & 0x10101000);
             int shift = 28 - decimalSepPos;
@@ -218,149 +241,135 @@ public class CalculateAverage_iziamos {
         void consume(final String name, final int min, final int max, final long sum, final long count);
     }
 
-    static class ByteBackedResultSet {
+    /**
+     * Open-addressing hash table living in an off-heap MemorySegment, one 64-byte
+     * struct per slot. A slot is empty while its name length is 0 (names are never empty).
+     * Names are not copied: each slot refers to the first occurrence in the mapped file.
+     */
+    static final class ResultTable implements AutoCloseable {
         private static final int MAP_SIZE = 16384 * 4;
         private static final int MASK = MAP_SIZE - 1;
         private static final long STRUCT_SIZE = 64;
         private static final long BYTE_SIZE = MAP_SIZE * STRUCT_SIZE;
-        private static final long STRING_OFFSET = 0;
-        private static final long STRING_LEN_OFFSET = 8;
-        private static final long HASH_OFFSET = 12;
-        private static final long MIN_OFFSET = 16;
-        private static final long MAX_OFFSET = 20;
-        private static final long SUM_OFFSET = 24;
-        private static final long COUNT_OFFSET = 32;
+        private static final long NAME_OFFSET = 0; // long: offset of the name in the file
+        private static final long STRING_LEN_OFFSET = 8; // int
+        private static final long HASH_OFFSET = 12; // int
+        private static final long MIN_OFFSET = 16; // int
+        private static final long MAX_OFFSET = 20; // int
+        private static final long SUM_OFFSET = 24; // long
+        private static final long COUNT_OFFSET = 32; // long
 
-        public static long createResultSet() {
-            final long baseAddress = UNSAFE.allocateMemory(BYTE_SIZE);
-            UNSAFE.setMemory(baseAddress, BYTE_SIZE, (byte) 0);
-            return baseAddress;
+        private final MemorySegment file;
+        private final Arena arena;
+        private final MemorySegment table;
+
+        ResultTable(final MemorySegment file) {
+            this.file = file;
+            // Shared, because a table is filled by a worker thread and then merged by main.
+            // The allocation is zero-initialised and 64-byte aligned.
+            this.arena = Arena.ofShared();
+            this.table = arena.allocate(BYTE_SIZE, 64);
         }
 
-        public static void put(final long baseAddress, final long address, final int length, final int hash, final int value) {
-            final long slot = findSlot(baseAddress, hash, address, length);
-            final long structBase = baseAddress + (slot * STRUCT_SIZE);
-
-            final int min = UNSAFE.getInt(structBase + MIN_OFFSET);
-            final int max = UNSAFE.getInt(structBase + MAX_OFFSET);
-            final long sum = UNSAFE.getLong(structBase + SUM_OFFSET);
-            final long count = UNSAFE.getLong(structBase + COUNT_OFFSET);
-
-            UNSAFE.putLong(structBase, address);
-            UNSAFE.putInt(structBase + STRING_LEN_OFFSET, length);
-            UNSAFE.putInt(structBase + HASH_OFFSET, hash);
-
-            UNSAFE.putInt(structBase + MIN_OFFSET, Math.min(value, min));
-            UNSAFE.putInt(structBase + MAX_OFFSET, Math.max(value, max));
-            UNSAFE.putLong(structBase + SUM_OFFSET, sum + value);
-            UNSAFE.putLong(structBase + COUNT_OFFSET, count + 1);
+        @Override
+        public void close() {
+            arena.close();
         }
 
-        public static void forEach(final long baseAddress, final ResultConsumer resultConsumer) {
-            for (long i = 0; i < BYTE_SIZE; i += STRUCT_SIZE) {
-                final long structBase = baseAddress + i;
-                final long stringBase = UNSAFE.getLong(structBase);
-                if (stringBase == 0) {
+        void put(final long nameOffset, final int length, final int hash, final int value) {
+            final long s = findSlot(nameOffset, length, hash);
+
+            final int min = table.get(INT, s + MIN_OFFSET);
+            final int max = table.get(INT, s + MAX_OFFSET);
+            final long sum = table.get(LONG, s + SUM_OFFSET);
+            final long count = table.get(LONG, s + COUNT_OFFSET);
+
+            table.set(INT, s + MIN_OFFSET, Math.min(value, min));
+            table.set(INT, s + MAX_OFFSET, Math.max(value, max));
+            table.set(LONG, s + SUM_OFFSET, sum + value);
+            table.set(LONG, s + COUNT_OFFSET, count + 1);
+        }
+
+        void forEach(final ResultConsumer resultConsumer) {
+            for (long s = 0; s < BYTE_SIZE; s += STRUCT_SIZE) {
+                final int strLen = table.get(INT, s + STRING_LEN_OFFSET);
+                if (strLen == 0) {
                     continue;
                 }
 
-                final int min = UNSAFE.getInt(structBase + MIN_OFFSET);
-                final int max = UNSAFE.getInt(structBase + MAX_OFFSET);
-                final long sum = UNSAFE.getLong(structBase + SUM_OFFSET);
-                final long count = UNSAFE.getLong(structBase + COUNT_OFFSET);
+                final long nameOffset = table.get(LONG, s + NAME_OFFSET);
+                final byte[] bytes = file.asSlice(nameOffset, strLen).toArray(BYTE);
 
-                final int strLen = UNSAFE.getInt(structBase + STRING_LEN_OFFSET);
-                final byte[] bytes = new byte[strLen];
-                for (int j = 0; j < strLen; ++j) {
-                    bytes[j] = UNSAFE.getByte(stringBase + j);
-                }
-
-                resultConsumer.consume(new String(bytes, UTF_8), min, max, sum, count);
+                resultConsumer.consume(
+                        new String(bytes, UTF_8),
+                        table.get(INT, s + MIN_OFFSET),
+                        table.get(INT, s + MAX_OFFSET),
+                        table.get(LONG, s + SUM_OFFSET),
+                        table.get(LONG, s + COUNT_OFFSET));
             }
         }
 
-        public static void merge(final long baseAddress, final long other) {
-            for (long i = 0; i < BYTE_SIZE; i += STRUCT_SIZE) {
-                final long otherStructBase = other + i;
-                if (UNSAFE.getLong(otherStructBase) == 0) {
+        void merge(final ResultTable other) {
+            for (long o = 0; o < BYTE_SIZE; o += STRUCT_SIZE) {
+                final int otherLength = other.table.get(INT, o + STRING_LEN_OFFSET);
+                if (otherLength == 0) {
                     continue;
                 }
 
-                final long otherStringStart = UNSAFE.getLong(otherStructBase);
-                final int otherStringLength = UNSAFE.getInt(otherStructBase + STRING_LEN_OFFSET);
-                final int otherStringHash = UNSAFE.getInt(otherStructBase + HASH_OFFSET);
+                final long otherName = other.table.get(LONG, o + NAME_OFFSET);
+                final int otherHash = other.table.get(INT, o + HASH_OFFSET);
 
-                final long slot = findSlot(baseAddress, otherStringHash, otherStringStart, otherStringLength);
+                final long s = findSlot(otherName, otherLength, otherHash);
 
-                final long thisStructBase = baseAddress + (slot * STRUCT_SIZE);
-
-                final int min = UNSAFE.getInt(thisStructBase + MIN_OFFSET);
-                final int max = UNSAFE.getInt(thisStructBase + MAX_OFFSET);
-                final long sum = UNSAFE.getLong(thisStructBase + SUM_OFFSET);
-                final long count = UNSAFE.getLong(thisStructBase + COUNT_OFFSET);
-
-                final int otherMin = UNSAFE.getInt(otherStructBase + MIN_OFFSET);
-                final int otherMax = UNSAFE.getInt(otherStructBase + MAX_OFFSET);
-                final long otherSum = UNSAFE.getLong(otherStructBase + SUM_OFFSET);
-                final long otherCount = UNSAFE.getLong(otherStructBase + COUNT_OFFSET);
-
-                UNSAFE.putLong(thisStructBase, otherStringStart);
-                UNSAFE.putInt(thisStructBase + STRING_LEN_OFFSET, otherStringLength);
-                UNSAFE.putInt(thisStructBase + HASH_OFFSET, otherStringHash);
-
-                UNSAFE.putInt(thisStructBase + MIN_OFFSET, Math.min(otherMin, min));
-                UNSAFE.putInt(thisStructBase + MAX_OFFSET, Math.max(otherMax, max));
-                UNSAFE.putLong(thisStructBase + SUM_OFFSET, sum + otherSum);
-                UNSAFE.putLong(thisStructBase + COUNT_OFFSET, count + otherCount);
+                table.set(INT, s + MIN_OFFSET, Math.min(table.get(INT, s + MIN_OFFSET), other.table.get(INT, o + MIN_OFFSET)));
+                table.set(INT, s + MAX_OFFSET, Math.max(table.get(INT, s + MAX_OFFSET), other.table.get(INT, o + MAX_OFFSET)));
+                table.set(LONG, s + SUM_OFFSET, table.get(LONG, s + SUM_OFFSET) + other.table.get(LONG, o + SUM_OFFSET));
+                table.set(LONG, s + COUNT_OFFSET, table.get(LONG, s + COUNT_OFFSET) + other.table.get(LONG, o + COUNT_OFFSET));
             }
         }
 
-        private static int findSlot(final long baseAddress,
-                                    final int hash,
-                                    final long otherStringAddress,
-                                    final int otherStringLength) {
+        /** Returns the byte offset of the slot's struct, claiming an empty slot if the name is new. */
+        private long findSlot(final long nameOffset, final int length, final int hash) {
+            for (int slot = hash & MASK;; slot = (slot + 1) & MASK) {
+                final long s = (long) slot * STRUCT_SIZE;
+                final int storedLength = table.get(INT, s + STRING_LEN_OFFSET);
 
-            for (int slot = mask(hash);; slot = mask(++slot)) {
-                final long structBase = baseAddress + ((long) slot * STRUCT_SIZE);
-                final long nameStart = UNSAFE.getLong(structBase);
-                if (nameStart == 0) {
-                    UNSAFE.putInt(structBase + MIN_OFFSET, Integer.MAX_VALUE);
-                    UNSAFE.putInt(structBase + MAX_OFFSET, Integer.MIN_VALUE);
-                    return slot;
+                if (storedLength == 0) {
+                    table.set(LONG, s + NAME_OFFSET, nameOffset);
+                    table.set(INT, s + STRING_LEN_OFFSET, length);
+                    table.set(INT, s + HASH_OFFSET, hash);
+                    table.set(INT, s + MIN_OFFSET, Integer.MAX_VALUE);
+                    table.set(INT, s + MAX_OFFSET, Integer.MIN_VALUE);
+                    return s;
                 }
 
-                final int nameLength = UNSAFE.getInt(structBase + STRING_LEN_OFFSET);
-                if (stringEquals(nameStart, nameLength, otherStringAddress, otherStringLength)) {
-                    return slot;
+                if (storedLength == length
+                        && table.get(INT, s + HASH_OFFSET) == hash
+                        && namesEqual(table.get(LONG, s + NAME_OFFSET), nameOffset, length)) {
+                    return s;
                 }
             }
         }
 
-        private static boolean stringEquals(final long thisNameAddress,
-                                            final int thisStringLength,
-                                            final long otherNameAddress,
-                                            final long otherNameLength) {
-            if (thisStringLength != otherNameLength) {
-                return false;
+        private boolean namesEqual(final long a, final long b, final int length) {
+            if (a == b) {
+                return true;
             }
 
             int i = 0;
-            for (; i < thisStringLength - 7; i += 8) {
-                if (UNSAFE.getLong(thisNameAddress + i) != UNSAFE.getLong(otherNameAddress + i)) {
+            for (; i < length - 7; i += 8) {
+                if (readWord(file, a + i) != readWord(file, b + i)) {
                     return false;
                 }
             }
 
-            final long remainingToCheck = thisStringLength - i;
-            final long finalBytesMask = ((1L << remainingToCheck * 8)) - 1;
-            final long thisLastWord = UNSAFE.getLong(thisNameAddress + i);
-            final long otherLastWord = UNSAFE.getLong(otherNameAddress + i);
+            final int remaining = length - i;
+            if (remaining == 0) {
+                return true;
+            }
 
-            return 0 == ((thisLastWord ^ otherLastWord) & finalBytesMask);
-        }
-
-        public static int mask(final int value) {
-            return MASK & value;
+            final long mask = (1L << (remaining * 8)) - 1;
+            return 0 == ((readWord(file, a + i) ^ readWord(file, b + i)) & mask);
         }
     }
 }

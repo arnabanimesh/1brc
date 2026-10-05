@@ -15,11 +15,10 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -33,20 +32,16 @@ import java.util.concurrent.ForkJoinPool;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+/**
+ * Java 27 compatible version.
+ * <p>
+ * The memory-access methods in {@code sun.misc.Unsafe} throw {@link UnsupportedOperationException} by default from
+ * JDK 26 and are slated for removal, so all memory access now goes through the Foreign Function & Memory API
+ * ({@link MemorySegment}, final since Java 22). Where the original code used raw memory addresses, this version uses
+ * byte offsets into the memory-mapped file's segment.
+ * </p>
+ */
 public class CalculateAverage_jonathanaotearoa {
-
-    public static final Unsafe UNSAFE;
-
-    static {
-        try {
-            final Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            UNSAFE = (Unsafe) theUnsafe.get(null);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException("Error getting instance of %s".formatted(Unsafe.class.getName()));
-        }
-    }
 
     private static final int WORD_BYTES = Long.BYTES;
     private static final Path FILE_PATH = Path.of("./measurements.txt");
@@ -54,6 +49,11 @@ public class CalculateAverage_jonathanaotearoa {
     private static final byte MAX_LINE_BYTES = 107;
     private static final byte NEW_LINE_BYTE = '\n';
     private static final long SEPARATOR_XOR_MASK = 0x3b3b3b3b3b3b3b3bL;
+
+    // Unaligned access is required, as we read words from arbitrary offsets.
+    // Uses the native byte order, which main() asserts is little endian.
+    private static final ValueLayout.OfLong WORD_LAYOUT = ValueLayout.JAVA_LONG_UNALIGNED;
+    private static final ValueLayout.OfByte BYTE_LAYOUT = ValueLayout.JAVA_BYTE;
 
     // A mask where the 4th bit of the 5th, 6th and 7th bytes is set to 1.
     // Leverages the fact that the 4th bit of a digit byte will 1.
@@ -89,7 +89,7 @@ public class CalculateAverage_jonathanaotearoa {
     private static String resultsToString(final Map<String, TemperatureData> results) {
         final Iterator<Map.Entry<String, TemperatureData>> i = results.entrySet().iterator();
         if (!i.hasNext()) {
-            System.out.println("{}");
+            return "{}";
         }
         // Capacity based the output for measurements.txt.
         final StringBuilder sb = new StringBuilder(1100).append('{');
@@ -173,11 +173,13 @@ public class CalculateAverage_jonathanaotearoa {
      * @throws IOException if an error occurs mapping the file channel into memory.
      */
     private static SortedMap<String, TemperatureData> processFile(final FileChannel fc, final long fileSize) throws IOException {
-        assert fileSize >= WORD_BYTES : "File size cannot be less than word size %s, but was {fileSize}".formatted(WORD_BYTES);
+        assert fileSize >= WORD_BYTES : "File size cannot be less than word size %s, but was %s".formatted(WORD_BYTES, fileSize);
 
-        try (final Arena arena = Arena.ofConfined()) {
-            final long fileAddress = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, arena).address();
-            return createChunks(fileAddress, fileSize)
+        // The arena must be shared, not confined, because the segment is accessed from the parallel stream's
+        // worker threads. A confined arena would throw WrongThreadException.
+        try (final Arena arena = Arena.ofShared()) {
+            final MemorySegment fileSegment = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, arena);
+            return createChunks(fileSegment, fileSize)
                     .parallel()
                     .map(CalculateAverage_jonathanaotearoa::processChunk)
                     .flatMap(Repository::entries)
@@ -196,36 +198,36 @@ public class CalculateAverage_jonathanaotearoa {
      * chunk size less than the maximum line size in bytes, then a single chunk is returned for the entire file.
      * </p>
      *
-     * @param fileAddress the address of the file.
+     * @param fileSegment the memory-mapped file.
      * @param fileSize    the size of the file in bytes.
      * @return a stream of chunks.
      */
-    private static Stream<Chunk> createChunks(final long fileAddress, final long fileSize) {
+    private static Stream<Chunk> createChunks(final MemorySegment fileSegment, final long fileSize) {
         // The number of cores - 1.
         final int parallelism = ForkJoinPool.getCommonPoolParallelism();
         final long chunkStep = fileSize / parallelism;
-        final long lastFileByteAddress = fileAddress + fileSize - 1;
+        final long lastFileByteOffset = fileSize - 1;
         if (chunkStep < MAX_LINE_BYTES) {
             // We're dealing with a small file, return a single chunk.
-            return Stream.of(new Chunk(fileAddress, lastFileByteAddress, true));
+            return Stream.of(new Chunk(fileSegment, 0, lastFileByteOffset, true));
         }
         final Chunk[] chunks = new Chunk[parallelism];
-        long startAddress = fileAddress;
+        long startOffset = 0;
         for (int i = 0, n = parallelism - 1; i < n; i++) {
             // Find end of the *previous* line.
             // We know there's a previous line in this chunk because chunkStep >= MAX_LINE_BYTES.
             // The last chunk may be slightly bigger than the others.
             // For a 1 billion line file, this has zero impact.
-            long lastByteAddress = startAddress + chunkStep;
-            while (UNSAFE.getByte(lastByteAddress) != NEW_LINE_BYTE) {
-                lastByteAddress--;
+            long lastByteOffset = startOffset + chunkStep;
+            while (fileSegment.get(BYTE_LAYOUT, lastByteOffset) != NEW_LINE_BYTE) {
+                lastByteOffset--;
             }
             // We've found the end of the previous line.
-            chunks[i] = new Chunk(startAddress, lastByteAddress, false);
-            startAddress = ++lastByteAddress;
+            chunks[i] = new Chunk(fileSegment, startOffset, lastByteOffset, false);
+            startOffset = ++lastByteOffset;
         }
         // The remaining bytes are assigned to the last chunk.
-        chunks[chunks.length - 1] = (new Chunk(startAddress, lastFileByteAddress, true));
+        chunks[chunks.length - 1] = new Chunk(fileSegment, startOffset, lastFileByteOffset, true);
         return Stream.of(chunks);
     }
 
@@ -236,18 +238,18 @@ public class CalculateAverage_jonathanaotearoa {
      * @return a repository containing the chunk's station data.
      */
     private static Repository processChunk(final Chunk chunk) {
-        final Repository repo = new Repository();
-        long address = chunk.startAddress;
+        final Repository repo = new Repository(chunk.fileSegment);
+        long offset = chunk.startOffset;
 
-        while (address <= chunk.lastByteAddress) {
+        while (offset <= chunk.lastByteOffset) {
             // Read station name.
-            long nameAddress = address;
+            long nameOffset = offset;
             long nameWord;
             long separatorMask;
             int nameHash = 1;
 
             while (true) {
-                nameWord = chunk.getWord(address);
+                nameWord = chunk.getWord(offset);
 
                 // Based on the Hacker's Delight "Find First 0-Byte" branch-free, 5-instruction, algorithm.
                 // See also https://graphics.stanford.edu/~seander/bithacks.html#ZeroInWord
@@ -256,7 +258,7 @@ public class CalculateAverage_jonathanaotearoa {
                 // If the separator is present, the first bit of the corresponding byte in the mask will be 1.
                 separatorMask = (separatorXorResult - 0x0101010101010101L) & (~separatorXorResult & 0x8080808080808080L);
                 if (separatorMask == 0) {
-                    address += Long.BYTES;
+                    offset += Long.BYTES;
                     // Multiplicative hashing, as per Arrays.hashCode().
                     // We could use XOR here, but it "might" produce more collisions.
                     nameHash = 31 * nameHash + Long.hashCode(nameWord);
@@ -270,7 +272,7 @@ public class CalculateAverage_jonathanaotearoa {
             // We only support little endian, so we use the *trailing* number of zeros to get the number of name bits.
             final int numberOfNameBits = Long.numberOfTrailingZeros(separatorMask) & ~7;
             final int numberOfNameBytes = numberOfNameBits >> 3;
-            final long separatorAddress = address + numberOfNameBytes;
+            final long separatorOffset = offset + numberOfNameBytes;
 
             if (numberOfNameBytes > 0) {
                 // Truncate the word, so we only have the portion before the separator, i.e. the name bytes.
@@ -280,8 +282,8 @@ public class CalculateAverage_jonathanaotearoa {
                 nameHash = 31 * nameHash + Long.hashCode(truncatedNameWord);
             }
 
-            final long tempAddress = separatorAddress + 1;
-            final long tempWord = chunk.getWord(tempAddress);
+            final long tempOffset = separatorOffset + 1;
+            final long tempWord = chunk.getWord(tempOffset);
 
             // "0" in UTF-8 is 48, which is 00110000 in binary.
             // The first 4 bits of any UTF-8 digit byte are therefore 0011.
@@ -314,11 +316,11 @@ public class CalculateAverage_jonathanaotearoa {
             final short unsignedTemp = (short) (b100 * 100 + b10 * 10 + b1);
             final short temp = (short) ((unsignedTemp + sign) ^ sign);
 
-            final byte nameSize = (byte) (separatorAddress - nameAddress);
-            repo.addTemp(nameHash, nameAddress, nameSize, temp);
+            final byte nameSize = (byte) (separatorOffset - nameOffset);
+            repo.addTemp(nameHash, nameOffset, nameSize, temp);
 
-            // Calculate the address of the next line.
-            address = tempAddress + decimalPointIndex + 3;
+            // Calculate the offset of the next line.
+            offset = tempOffset + decimalPointIndex + 3;
         }
 
         return repo;
@@ -327,42 +329,43 @@ public class CalculateAverage_jonathanaotearoa {
     /**
      * Represents a portion of a file containing 1 or more whole lines.
      *
-     * @param startAddress    the memory address of the first byte.
-     * @param lastByteAddress the memory address of the last byte.
-     * @param lastWordAddress the memory address of the last whole word.
-     * @param isLast          whether this is the last chunk.
+     * @param fileSegment    the memory-mapped file. Offsets are relative to the start of this segment.
+     * @param startOffset    the offset of the first byte.
+     * @param lastByteOffset the offset of the last byte.
+     * @param lastWordOffset the offset of the last whole word.
+     * @param isLast         whether this is the last chunk.
      */
-    private record Chunk(long startAddress, long lastByteAddress, long lastWordAddress, boolean isLast) {
+    private record Chunk(MemorySegment fileSegment, long startOffset, long lastByteOffset, long lastWordOffset, boolean isLast) {
 
-        public Chunk(final long startAddress, final long lastByteAddress, final boolean isLast) {
-            this(startAddress, lastByteAddress, lastByteAddress - (Long.BYTES - 1), isLast);
+        public Chunk(final MemorySegment fileSegment, final long startOffset, final long lastByteOffset, final boolean isLast) {
+            this(fileSegment, startOffset, lastByteOffset, lastByteOffset - (Long.BYTES - 1), isLast);
 
-            assert lastByteAddress > startAddress : "lastByteAddress %s must be > startAddress {startAddress}".formatted(lastByteAddress);
-            assert lastWordAddress >= startAddress : "lastWordAddress %s must be >= startAddress {startAddress}".formatted(lastWordAddress);
+            assert lastByteOffset > startOffset : "lastByteOffset %s must be > startOffset %s".formatted(lastByteOffset, startOffset);
+            assert lastWordOffset >= startOffset : "lastWordOffset %s must be >= startOffset %s".formatted(lastWordOffset, startOffset);
         }
 
         /**
          * Gets an 8 byte word from this chunk.
          * <p>
-         * If the specified address is greater than {@link Chunk#lastWordAddress} and {@link Chunk#isLast}, the word
+         * If the specified offset is greater than {@link Chunk#lastWordOffset} and {@link Chunk#isLast}, the word
          * will be truncated. This ensures we never read beyond the end of the file.
          * </p>
          *
-         * @param address the address of the word we want.
-         * @return the word at the specified address.
+         * @param offset the offset of the word we want.
+         * @return the word at the specified offset.
          */
-        public long getWord(final long address) {
-            assert address >= startAddress : "address must be >= startAddress %s, but was {address}".formatted(startAddress);
-            assert address < lastByteAddress : "address must be < lastByteAddress %s, but was {address}".formatted(lastByteAddress);
+        public long getWord(final long offset) {
+            assert offset >= startOffset : "offset must be >= startOffset %s, but was %s".formatted(startOffset, offset);
+            assert offset < lastByteOffset : "offset must be < lastByteOffset %s, but was %s".formatted(lastByteOffset, offset);
 
-            if (isLast && address > lastWordAddress) {
-                // Make sure we don't read beyond the end of the file and potentially crash the JVM.
-                final long word = UNSAFE.getLong(lastWordAddress);
-                final int bytesToDiscard = (int) (address - lastWordAddress);
+            if (isLast && offset > lastWordOffset) {
+                // Make sure we don't read beyond the end of the file.
+                final long word = fileSegment.get(WORD_LAYOUT, lastWordOffset);
+                final int bytesToDiscard = (int) (offset - lastWordOffset);
                 // As with elsewhere, this assumes little endianness.
                 return word >>> (bytesToDiscard << 3);
             }
-            return UNSAFE.getLong(address);
+            return fileSegment.get(WORD_LAYOUT, offset);
         }
     }
 
@@ -444,14 +447,16 @@ public class CalculateAverage_jonathanaotearoa {
 
     private static final class StationData extends TemperatureData implements Comparable<StationData> {
 
+        private final MemorySegment fileSegment;
         private final int nameHash;
-        private final long nameAddress;
+        private final long nameOffset;
         private final byte nameSize;
         private String name;
 
-        StationData(final int nameHash, final long nameAddress, final byte nameSize, final short temp) {
+        StationData(final MemorySegment fileSegment, final int nameHash, final long nameOffset, final byte nameSize, final short temp) {
             super(temp);
-            this.nameAddress = nameAddress;
+            this.fileSegment = fileSegment;
+            this.nameOffset = nameOffset;
             this.nameSize = nameSize;
             this.nameHash = nameHash;
         }
@@ -463,8 +468,7 @@ public class CalculateAverage_jonathanaotearoa {
 
         String getName() {
             if (name == null) {
-                final byte[] nameBytes = new byte[nameSize];
-                UNSAFE.copyMemory(null, nameAddress, nameBytes, UNSAFE.arrayBaseOffset(nameBytes.getClass()), nameSize);
+                final byte[] nameBytes = fileSegment.asSlice(nameOffset, nameSize).toArray(BYTE_LAYOUT);
                 name = new String(nameBytes, StandardCharsets.UTF_8);
             }
             return name;
@@ -479,24 +483,26 @@ public class CalculateAverage_jonathanaotearoa {
         private static final int CAPACITY = 100_003;
         private static final int LAST_INDEX = CAPACITY - 1;
 
+        private final MemorySegment fileSegment;
         private final StationData[] table;
 
-        public Repository() {
+        public Repository(final MemorySegment fileSegment) {
+            this.fileSegment = fileSegment;
             this.table = new StationData[CAPACITY];
         }
 
         /**
          * Adds a station temperature value to this repository.
          *
-         * @param nameHash    the station name hash.
-         * @param nameAddress the station name address in memory.
-         * @param nameSize    the station name size in bytes.
-         * @param temp        the temperature value.
+         * @param nameHash   the station name hash.
+         * @param nameOffset the station name offset in the file segment.
+         * @param nameSize   the station name size in bytes.
+         * @param temp       the temperature value.
          */
-        public void addTemp(final int nameHash, final long nameAddress, final byte nameSize, short temp) {
-            final int index = findIndex(nameHash, nameAddress, nameSize);
+        public void addTemp(final int nameHash, final long nameOffset, final byte nameSize, short temp) {
+            final int index = findIndex(nameHash, nameOffset, nameSize);
             if (table[index] == null) {
-                table[index] = new StationData(nameHash, nameAddress, nameSize, temp);
+                table[index] = new StationData(fileSegment, nameHash, nameOffset, nameSize, temp);
             }
             else {
                 table[index].addTemp(temp);
@@ -507,17 +513,17 @@ public class CalculateAverage_jonathanaotearoa {
             return Arrays.stream(table).filter(Objects::nonNull);
         }
 
-        private int findIndex(int nameHash, final long nameAddress, final byte nameSize) {
+        private int findIndex(int nameHash, final long nameOffset, final byte nameSize) {
             // Think about replacing modulo.
             // https://lemire.me/blog/2018/08/20/performance-of-ranged-accesses-into-arrays-modulo-multiply-shift-and-masks/
             int index = (nameHash & 0x7FFFFFFF) % CAPACITY;
-            while (isCollision(index, nameHash, nameAddress, nameSize)) {
+            while (isCollision(index, nameHash, nameOffset, nameSize)) {
                 index = index == LAST_INDEX ? 0 : index + 1;
             }
             return index;
         }
 
-        private boolean isCollision(final int index, final long nameHash, final long nameAddress, final byte nameSize) {
+        private boolean isCollision(final int index, final int nameHash, final long nameOffset, final byte nameSize) {
             final StationData existing = table[index];
             if (existing == null) {
                 return false;
@@ -529,24 +535,30 @@ public class CalculateAverage_jonathanaotearoa {
                 return true;
             }
             // Last resort; check if the names are the same.
-            // This is real performance hit :(
-            return !isMemoryEqual(nameAddress, existing.nameAddress, nameSize);
+            return !isMemoryEqual(nameOffset, existing.nameOffset, nameSize);
         }
 
         /**
-         * Checks if two locations in memory have the same value.
+         * Checks if two locations in the file segment have the same value.
+         * <p>
+         * Compares a word at a time, then any remaining tail bytes. Never reads beyond {@code size} bytes from
+         * either offset.
+         * </p>
          *
-         * @param address1 the address of the first location.
-         * @param address2 the address of the second locations.
-         * @param size     the number of bytes to check for equality.
-         * @return true if both addresses contain the same bytes.
+         * @param offset1 the offset of the first location.
+         * @param offset2 the offset of the second location.
+         * @param size    the number of bytes to check for equality.
+         * @return true if both offsets contain the same bytes.
          */
-        private static boolean isMemoryEqual(final long address1, final long address2, final byte size) {
-            // Checking 1 byte at a time, so we can bail as early as possible.
-            for (int offset = 0; offset < size; offset++) {
-                final byte b1 = UNSAFE.getByte(address1 + offset);
-                final byte b2 = UNSAFE.getByte(address2 + offset);
-                if (b1 != b2) {
+        private boolean isMemoryEqual(final long offset1, final long offset2, final byte size) {
+            int i = 0;
+            for (; i + WORD_BYTES <= size; i += WORD_BYTES) {
+                if (fileSegment.get(WORD_LAYOUT, offset1 + i) != fileSegment.get(WORD_LAYOUT, offset2 + i)) {
+                    return false;
+                }
+            }
+            for (; i < size; i++) {
+                if (fileSegment.get(BYTE_LAYOUT, offset1 + i) != fileSegment.get(BYTE_LAYOUT, offset2 + i)) {
                     return false;
                 }
             }

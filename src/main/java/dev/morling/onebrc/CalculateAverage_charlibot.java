@@ -15,10 +15,9 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -27,22 +26,14 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
+/**
+ * Java 22+ (tested target: Java 27). Uses the standard Foreign Function & Memory API
+ * (java.lang.foreign) instead of sun.misc.Unsafe, whose memory-access methods are
+ * terminally deprecated (JEP 471 / JEP 498) and denied by default in newer JDKs.
+ */
 public class CalculateAverage_charlibot {
 
     private static final String FILE = "./measurements.txt";
-
-    private static final Unsafe UNSAFE = initUnsafe();
-
-    private static Unsafe initUnsafe() {
-        try {
-            final Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
 
     private static final int MAP_CAPACITY = 16384; // Need at least 10,000 so 2^14 = 16384. Might need 2^15 = 32768.
 
@@ -68,7 +59,7 @@ public class CalculateAverage_charlibot {
     static class Measurement {
         int min;
         int max;
-        int sum;
+        long sum; // long so that huge inputs can't overflow
         int count;
 
         Measurement(int value) {
@@ -93,23 +84,26 @@ public class CalculateAverage_charlibot {
 
     static class MeasurementMap3 {
 
+        private final MemorySegment file;
         final Measurement[] measurements;
         final byte[][] cities;
 
         final int capacity = MAP_CAPACITY;
 
-        MeasurementMap3() {
+        MeasurementMap3(MemorySegment file) {
+            this.file = file;
             measurements = new Measurement[capacity];
             cities = new byte[capacity][128]; // 100 bytes for the city. Round up to nearest power of 2.
         }
 
-        public void insert(long fromAddress, long toAddress, int hashcode, int value) {
+        /** fromOffset / toOffset are byte offsets into the mapped file segment. */
+        public void insert(long fromOffset, long toOffset, int hashcode, int value) {
             int index = hashcode & (capacity - 1); // same trick as in hashmap. This is the same as (% capacity).
-            tryInsert(index, fromAddress, toAddress, value);
+            tryInsert(index, fromOffset, toOffset, value);
         }
 
-        private void tryInsert(int mapIndex, long fromAddress, long toAddress, int value) {
-            byte length = (byte) (toAddress - fromAddress);
+        private void tryInsert(int mapIndex, long fromOffset, long toOffset, int value) {
+            byte length = (byte) (toOffset - fromOffset);
             outer: while (true) {
                 byte[] cityArray = cities[mapIndex];
                 Measurement jas = measurements[mapIndex];
@@ -117,7 +111,7 @@ public class CalculateAverage_charlibot {
                     if (cityArray[0] == length) {
                         int i = 0;
                         while (i < length) {
-                            byte b = UNSAFE.getByte(fromAddress + i);
+                            byte b = file.get(ValueLayout.JAVA_BYTE, fromOffset + i);
                             if (b != cityArray[i + 1]) {
                                 mapIndex = (mapIndex + 1) & (capacity - 1);
                                 continue outer;
@@ -136,16 +130,10 @@ public class CalculateAverage_charlibot {
                 }
                 else {
                     // just insert
-                    int i = 0;
                     cityArray[0] = length;
-                    while (i < length) {
-                        byte b = UNSAFE.getByte(fromAddress + i);
-                        cityArray[i + 1] = b;
-                        i++;
-                    }
+                    MemorySegment.copy(file, ValueLayout.JAVA_BYTE, fromOffset, cityArray, 1, length);
                     measurements[mapIndex] = new Measurement(value);
                     break;
-
                 }
             }
         }
@@ -169,71 +157,83 @@ public class CalculateAverage_charlibot {
         }
     }
 
-    public static long[] getChunks(int numChunks) throws Exception {
+    /**
+     * Splits the file into numChunks byte ranges, each starting at the beginning of a line.
+     * Returns numChunks + 1 offsets; chunk i is [chunks[i], chunks[i + 1]).
+     */
+    static long[] getChunks(MemorySegment file, int numChunks) {
+        long fileSize = file.byteSize();
+        long sizeOfChunk = fileSize / numChunks;
         long[] chunks = new long[numChunks + 1];
-        try (FileChannel fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
-            long fileSize = fileChannel.size();
-            long sizeOfChunk = fileSize / numChunks;
-            var address = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
-            chunks[0] = address;
-            for (int processIdx = 1; processIdx < numChunks; processIdx++) {
-                long chunkAddress = processIdx * sizeOfChunk + address;
-                while (UNSAFE.getByte(chunkAddress) != '\n') {
-                    chunkAddress++;
-                }
-                chunkAddress++;
-                chunks[processIdx] = chunkAddress;
+        chunks[0] = 0;
+        for (int processIdx = 1; processIdx < numChunks; processIdx++) {
+            // never start before the previous boundary (only matters for tiny files)
+            long offset = Math.max(processIdx * sizeOfChunk, chunks[processIdx - 1]);
+            while (offset < fileSize && file.get(ValueLayout.JAVA_BYTE, offset) != '\n') {
+                offset++;
             }
-            chunks[numChunks] = address + fileSize;
+            chunks[processIdx] = Math.min(offset + 1, fileSize);
         }
+        chunks[numChunks] = fileSize;
         return chunks;
+    }
+
+    private static HashMap<String, Measurement> processChunk(MemorySegment file, long chunkStart, long chunkEnd) {
+        MeasurementMap3 measurements = new MeasurementMap3(file);
+        long chunkIdx = chunkStart;
+        while (chunkIdx < chunkEnd) {
+            long cityStart = chunkIdx;
+            byte b;
+            int hashcode = 0;
+            while ((b = file.get(ValueLayout.JAVA_BYTE, chunkIdx)) != ';') {
+                hashcode = 31 * hashcode + b;
+                chunkIdx++;
+            }
+            long cityEnd = chunkIdx;
+            chunkIdx++;
+            int multiplier = 1;
+            b = file.get(ValueLayout.JAVA_BYTE, chunkIdx);
+            if (b == '-') {
+                multiplier = -1;
+                chunkIdx++;
+            }
+            int value = 0;
+            while ((b = file.get(ValueLayout.JAVA_BYTE, chunkIdx)) != '\n') {
+                if (b != '.') {
+                    value = (value * 10) + (b - '0');
+                }
+                chunkIdx++;
+            }
+            value = value * multiplier;
+            measurements.insert(cityStart, cityEnd, hashcode, value);
+            chunkIdx++;
+        }
+        return measurements.toMap();
     }
 
     public static void memoryMap() throws Exception {
         int numProcessors = Runtime.getRuntime().availableProcessors();
-        long[] chunks = getChunks(numProcessors);
+
+        // The mapping stays valid after the channel is closed; Arena.global() keeps it alive
+        // for the life of the JVM and makes it accessible from every worker thread.
+        MemorySegment file;
+        try (FileChannel fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+            file = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileChannel.size(), Arena.global());
+        }
+
+        long[] chunks = getChunks(file, numProcessors);
+
         try (ExecutorService executorService = Executors.newWorkStealingPool(numProcessors)) {
-            Future[] results = new Future[numProcessors];
+            List<Future<HashMap<String, Measurement>>> results = new ArrayList<>(numProcessors);
             for (int processIdx = 0; processIdx < numProcessors; processIdx++) {
-                int finalProcessIdx = processIdx;
-                Future<HashMap<String, Measurement>> future = executorService.submit(() -> {
-                    long chunkIdx = chunks[finalProcessIdx];
-                    long chunkEnd = chunks[finalProcessIdx + 1];
-                    MeasurementMap3 measurements = new MeasurementMap3();
-                    while (chunkIdx < chunkEnd) {
-                        long cityStart = chunkIdx;
-                        byte b;
-                        int hashcode = 0;
-                        while ((b = UNSAFE.getByte(chunkIdx)) != ';') {
-                            hashcode = 31 * hashcode + b;
-                            chunkIdx++;
-                        }
-                        long cityEnd = chunkIdx;
-                        chunkIdx++;
-                        int multiplier = 1;
-                        b = UNSAFE.getByte(chunkIdx);
-                        if (b == '-') {
-                            multiplier = -1;
-                            chunkIdx++;
-                        }
-                        int value = 0;
-                        while ((b = UNSAFE.getByte(chunkIdx)) != '\n') {
-                            if (b != '.') {
-                                value = (value * 10) + (b - '0');
-                            }
-                            chunkIdx++;
-                        }
-                        value = value * multiplier;
-                        measurements.insert(cityStart, cityEnd, hashcode, value);
-                        chunkIdx++;
-                    }
-                    return measurements.toMap();
-                });
-                results[processIdx] = future;
+                final long chunkStart = chunks[processIdx];
+                final long chunkEnd = chunks[processIdx + 1];
+                results.add(executorService.submit(() -> processChunk(file, chunkStart, chunkEnd)));
             }
+
             final HashMap<String, Measurement> measurements = new HashMap<>();
-            for (Future f : results) {
-                HashMap<String, Measurement> m = (HashMap<String, Measurement>) f.get();
+            for (Future<HashMap<String, Measurement>> f : results) {
+                HashMap<String, Measurement> m = f.get();
                 m.forEach((city, measurement) -> {
                     measurements.merge(city, measurement, (oldValue, newValue) -> {
                         Measurement mmm = new Measurement(0);

@@ -15,82 +15,52 @@
  */
 package dev.morling.onebrc;
 
-import java.io.File;
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Iterator;
-import java.util.Spliterator;
-import java.util.Spliterators;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
-import sun.misc.Unsafe;
 
+/**
+ * Java 22+ compatible (including Java 27): uses the standard Foreign Function &amp; Memory API
+ * ({@link MemorySegment}) instead of {@code sun.misc.Unsafe}, whose memory-access methods
+ * throw by default from JDK 26 onwards (JEP 471 / JEP 498).
+ */
 public class CalculateAverage_kuduwa_keshavram {
 
     private static final String FILE = "./measurements.txt";
-    private static final Unsafe UNSAFE = initUnsafe();
 
-    private static Unsafe initUnsafe() {
-        try {
-            final Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
+    /** Max station name length in bytes (the challenge guarantees <= 100). */
+    private static final int MAX_NAME_BYTES = 128;
+
+    /** Open-addressing table size; must be a power of two. Challenge has at most 10,000 stations. */
+    private static final int TABLE_SIZE = 1 << 17;
+
+    public static void main(String[] args) throws IOException {
+        final MemorySegment file;
+        try (FileChannel channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+            // The mapping stays valid after the channel is closed; Arena.global() never unmaps it.
+            file = channel.map(MapMode.READ_ONLY, 0, channel.size(), Arena.global());
         }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
 
-    public static void main(String[] args) throws IOException, InterruptedException {
-        TreeMap<String, Measurement> resultMap = getFileSegments(new File(FILE))
-                .flatMap(
-                        segment -> {
-                            Result result = new Result();
-                            while (segment.start < segment.end) {
-                                byte[] city = new byte[100];
-                                byte b;
-                                int hash = 0;
-                                int i = 0;
-                                while ((b = UNSAFE.getByte(segment.start++)) != 59) {
-                                    hash = 31 * hash + b;
-                                    city[i++] = b;
-                                }
-
-                                byte[] newCity = new byte[i];
-                                System.arraycopy(city, 0, newCity, 0, i);
-                                int measurement = 0;
-                                boolean negative = false;
-                                while ((b = UNSAFE.getByte(segment.start++)) != 10) {
-                                    if (b == 45) {
-                                        negative = true;
-                                    }
-                                    else if (b == 46) {
-                                        // skip
-                                    }
-                                    else {
-                                        final int n = b - '0';
-                                        measurement = measurement * 10 + n;
-                                    }
-                                }
-                                putOrMerge(
-                                        result,
-                                        new Measurement(hash, newCity, negative ? measurement * -1 : measurement));
-                            }
-                            Iterator<Measurement> iterator = getMeasurementIterator(result);
-                            return StreamSupport.stream(
-                                    Spliterators.spliteratorUnknownSize(iterator, Spliterator.NONNULL), true);
-                        })
+        TreeMap<String, Measurement> resultMap = getFileSegments(file)
+                .flatMap(segment -> processSegment(file, segment).stream())
                 .collect(
                         Collectors.toMap(
-                                measurement -> new String(measurement.city),
+                                measurement -> new String(measurement.city, StandardCharsets.UTF_8),
                                 Function.identity(),
                                 (m1, m2) -> {
                                     m1.merge(m2);
@@ -101,74 +71,69 @@ public class CalculateAverage_kuduwa_keshavram {
         System.out.println(resultMap);
     }
 
-    private static Iterator<Measurement> getMeasurementIterator(Result result) {
-        return new Iterator<>() {
-            final int uniqueIndex = result.uniqueIndex;
-            final int[] indexArray = result.indexArray;
-            final Measurement[][] measurements = result.measurements;
+    private static Result processSegment(MemorySegment file, FileSegment segment) {
+        final Result result = new Result();
+        final byte[] name = new byte[MAX_NAME_BYTES]; // reused for every row; copied only on first sight
+        final long end = segment.end();
+        long pos = segment.start();
 
-            int i = 0;
-            int j = 0;
-
-            @Override
-            public boolean hasNext() {
-                return i < uniqueIndex;
+        while (pos < end) {
+            byte b;
+            int hash = 0;
+            int len = 0;
+            while ((b = file.get(JAVA_BYTE, pos++)) != ';') {
+                hash = 31 * hash + b;
+                name[len++] = b;
             }
 
-            @Override
-            public Measurement next() {
-                Measurement measurement = measurements[indexArray[i]][j++];
-                if (measurements[indexArray[i]][j] == null) {
-                    i++;
-                    j = 0;
+            int temp = 0; // tenths of a degree
+            boolean negative = false;
+            while (pos < end && (b = file.get(JAVA_BYTE, pos++)) != '\n') {
+                if (b == '-') {
+                    negative = true;
                 }
-                return measurement;
-            }
-        };
-    }
-
-    static class Result {
-        final Measurement[][] measurements = new Measurement[1024 * 128][3];
-        final int[] indexArray = new int[10_000];
-        int uniqueIndex = 0;
-    }
-
-    private static void putOrMerge(Result result, Measurement measurement) {
-        int index = measurement.hash & (result.measurements.length - 1);
-        Measurement[] existing = result.measurements[index];
-        for (int i = 0; i < existing.length; i++) {
-            Measurement existingMeasurement = existing[i];
-            if (existingMeasurement == null) {
-                result.measurements[index][i] = measurement;
-                if (i == 0) {
-                    result.indexArray[result.uniqueIndex++] = index;
+                else if (b != '.') {
+                    temp = temp * 10 + (b - '0');
                 }
-                return;
             }
-            if (equals(existingMeasurement.city, measurement.city)) {
-                existingMeasurement.merge(measurement);
-                return;
+            result.add(hash, name, len, negative ? -temp : temp);
+        }
+        return result;
+    }
+
+    /** Per-segment hash table with linear probing. */
+    private static final class Result {
+        private final Measurement[] table = new Measurement[TABLE_SIZE];
+        private int size = 0;
+
+        void add(int hash, byte[] name, int len, int temp) {
+            final int mask = TABLE_SIZE - 1;
+            int index = (hash ^ (hash >>> 16)) & mask;
+            while (true) {
+                final Measurement existing = table[index];
+                if (existing == null) {
+                    if (size >= TABLE_SIZE / 2) {
+                        throw new IllegalStateException("Too many distinct stations");
+                    }
+                    table[index] = new Measurement(hash, Arrays.copyOf(name, len), temp);
+                    size++;
+                    return;
+                }
+                if (existing.hash == hash
+                        && Arrays.equals(existing.city, 0, existing.city.length, name, 0, len)) {
+                    existing.add(temp);
+                    return;
+                }
+                index = (index + 1) & mask;
             }
+        }
+
+        Stream<Measurement> stream() {
+            return Arrays.stream(table).filter(Objects::nonNull);
         }
     }
 
-    private static boolean equals(byte[] city1, byte[] city2) {
-        for (int i = 0; i < city1.length; i++) {
-            if (city1[i] != city2[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static final class FileSegment {
-        long start;
-        long end;
-
-        private FileSegment(long start, long end) {
-            this.start = start;
-            this.end = end;
-        }
+    private record FileSegment(long start, long end) {
     }
 
     private static final class Measurement {
@@ -178,51 +143,64 @@ public class CalculateAverage_kuduwa_keshavram {
 
         int min;
         int max;
-        int sum;
-        int count;
+        long sum;
+        long count;
 
         private Measurement(int hash, byte[] city, int temp) {
             this.hash = hash;
             this.city = city;
-            this.min = this.max = this.sum = temp;
+            this.min = this.max = temp;
+            this.sum = temp;
             this.count = 1;
         }
 
+        private void add(int temp) {
+            if (temp < this.min) {
+                this.min = temp;
+            }
+            if (temp > this.max) {
+                this.max = temp;
+            }
+            this.sum += temp;
+            this.count++;
+        }
+
         private void merge(Measurement m2) {
-            this.min = this.min < m2.min ? this.min : m2.min;
-            this.max = this.max > m2.max ? this.max : m2.max;
-            this.sum = this.sum + m2.sum;
-            this.count = this.count + m2.count;
+            this.min = Math.min(this.min, m2.min);
+            this.max = Math.max(this.max, m2.max);
+            this.sum += m2.sum;
+            this.count += m2.count;
         }
 
         @Override
         public String toString() {
+            // Mean is rounded in whole tenths (ties toward +infinity) so the result doesn't depend on
+            // binary floating-point representation of values like x.x5.
+            final long meanTenths = Math.round((double) this.sum / this.count);
             return String.format(
-                    "%.1f/%.1f/%.1f", this.min / 10f, (this.sum / 10f) / this.count, this.max / 10f);
+                    Locale.ROOT, "%.1f/%.1f/%.1f", this.min / 10.0, meanTenths / 10.0, this.max / 10.0);
         }
     }
 
-    private static Stream<FileSegment> getFileSegments(final File file) throws IOException {
+    private static Stream<FileSegment> getFileSegments(final MemorySegment file) {
         final int numberOfSegments = Runtime.getRuntime().availableProcessors() * 4;
+        final long fileSize = file.byteSize();
+        final long segmentSize = (fileSize + numberOfSegments - 1) / numberOfSegments;
         final long[] chunks = new long[numberOfSegments + 1];
-        try (var fileChannel = FileChannel.open(file.toPath(), StandardOpenOption.READ)) {
-            final long fileSize = fileChannel.size();
-            final long segmentSize = (fileSize + numberOfSegments - 1) / numberOfSegments;
-            final long mappedAddress = fileChannel.map(MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
-            chunks[0] = mappedAddress;
-            final long endAddress = mappedAddress + fileSize;
-            for (int i = 1; i < numberOfSegments; ++i) {
-                long chunkAddress = mappedAddress + i * segmentSize;
-                // Align to first row start.
-                while (chunkAddress < endAddress && UNSAFE.getByte(chunkAddress++) != '\n') {
-                    // nop
-                }
-                chunks[i] = Math.min(chunkAddress, endAddress);
+
+        chunks[0] = 0;
+        for (int i = 1; i < numberOfSegments; ++i) {
+            long pos = Math.min(i * segmentSize, fileSize);
+            // Align to first row start.
+            while (pos < fileSize && file.get(JAVA_BYTE, pos++) != '\n') {
+                // nop
             }
-            chunks[numberOfSegments] = endAddress;
+            chunks[i] = pos;
         }
-        return IntStream.range(0, chunks.length - 1)
-                .mapToObj(chunkIndex -> new FileSegment(chunks[chunkIndex], chunks[chunkIndex + 1]))
+        chunks[numberOfSegments] = fileSize;
+
+        return IntStream.range(0, numberOfSegments)
+                .mapToObj(i -> new FileSegment(chunks[i], chunks[i + 1]))
                 .parallel();
     }
 

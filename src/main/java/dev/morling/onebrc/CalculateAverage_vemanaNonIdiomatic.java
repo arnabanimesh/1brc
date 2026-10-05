@@ -18,12 +18,10 @@ package dev.morling.onebrc;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -44,13 +42,32 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import sun.misc.Unsafe;
 
 /**
  * Unlike its sister submission {@code CalculateAverage_vemana}, this submission employs non
- * idiomatic methods such as SWAR and Unsafe.
+ * idiomatic methods such as SWAR and raw native addresses.
  *
  * <p>For details on how this solution works, check the documentation on the sister submission.
+ *
+ * <p>JAVA 27 PORT NOTES
+ *
+ * <ul>
+ *   <li>{@code sun.misc.Unsafe} memory access is gone. Its replacement is the Foreign Function &amp;
+ *       Memory API ({@code java.lang.foreign}, final since JDK 22). Raw addresses are still used
+ *       throughout, via a zero-based {@link MemorySegment} spanning the whole address space (see
+ *       {@link Unsafely}).
+ *   <li>Mapped files now come from {@code FileChannel.map(.., Arena)} and are unmapped with {@code
+ *       Arena.close()}. This replaces the reflective {@code cleaner()}/{@code address()} hacks,
+ *       which need {@code --add-opens java.base/java.nio=ALL-UNNAMED} and break on modern JDKs.
+ *   <li>The text blocks that contained {@code {expr}} placeholders were never interpolated (string
+ *       templates were removed from the language); they now use {@code String.formatted}.
+ * </ul>
+ *
+ * <p>Compile: {@code javac --release 27 CalculateAverage_vemanaNonIdiomatic.java}
+ *
+ * <p>Run: {@code java --enable-native-access=ALL-UNNAMED dev.morling.onebrc.CalculateAverage_vemanaNonIdiomatic}
+ * ({@code MemorySegment.reinterpret} is a restricted method; the flag avoids the warning today and
+ * the error that future JDKs will raise by default.)
  */
 public class CalculateAverage_vemanaNonIdiomatic {
 
@@ -59,9 +76,10 @@ public class CalculateAverage_vemanaNonIdiomatic {
         System.err.println(
                 """
                         ------------------------------------------------
-                        Running {className}
+                        Running %s
                         -------------------------------------------------
-                        """);
+                        """
+                        .formatted(className));
         Tracing.recordAppStart();
         Runtime.getRuntime()
                 .addShutdownHook(
@@ -146,16 +164,16 @@ public class CalculateAverage_vemanaNonIdiomatic {
         Tracing.recordEvent("Final result printed");
     }
 
-  public record AggregateResult(Map<String, Stat> tempStats) {
+    public record AggregateResult(Map<String, Stat> tempStats) {
 
-    @Override
-    public String toString() {
-      return this.tempStats().entrySet().stream()
-          .sorted(Map.Entry.comparingByKey())
-          .map(entry -> "%s=%s".formatted(entry.getKey(), entry.getValue()))
-          .collect(Collectors.joining(", ", "{", "}"));
+        @Override
+        public String toString() {
+            return this.tempStats().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> "%s=%s".formatted(entry.getKey(), entry.getValue()))
+                    .collect(Collectors.joining(", ", "{", "}"));
+        }
     }
-  }
 
     // Mutable to avoid allocation
     public static class ByteRange {
@@ -166,27 +184,31 @@ public class CalculateAverage_vemanaNonIdiomatic {
         private final long maxEndPos; // Treat as if the file ends here
         private final RandomAccessFile raf;
         private final int shardIdx;
-        private final List<MappedByteBuffer> unclosedBuffers = new ArrayList<>();
+        private final List<Arena> unclosedArenas = new ArrayList<>();
         // ***************** What this is doing and why *****************
-        // Reading from ByteBuffer appears faster from MemorySegment, but ByteBuffer can only be
-        // Integer.MAX_VALUE long; Creating one byteBuffer per chunk kills native memory quota
-        // and JVM crashes without futher parameters.
+        // Creating one mapping per chunk kills native memory quota and the JVM crashes without
+        // further parameters. (Historically this was also because a ByteBuffer can only be
+        // Integer.MAX_VALUE long; a MemorySegment has no such limit, but we keep the window
+        // design since it also controls how early we can unmap.)
         //
-        // So, in this solution, create a sliding window of bytebuffers:
-        // - Create a large bytebuffer that spans the chunk
-        // - If the next chunk falls outside the byteBuffer, create another byteBuffer that spans the
-        // chunk. Because chunks are allocated serially, a single large (1<<30) byteBuffer spans
+        // So, in this solution, create a sliding window of mappings:
+        // - Create a large mapping that spans the chunk
+        // - If the next chunk falls outside the mapping, create another mapping that spans the
+        // chunk. Because chunks are allocated serially, a single large mapping spans
         // many successive chunks.
         // - In fact, for serial chunk allocation (which is friendly to page faulting anyway),
-        // the number of created ByteBuffers doesn't exceed [size of shard/(1<<30)] which is less than
-        // 100/thread and is comfortably below what the JVM can handle (65K) without further param
-        // tuning
+        // the number of created mappings doesn't exceed [size of shard/BUF_SIZE] which is
+        // comfortably small.
         // - This enables (relatively) allocation free chunking implementation. Our chunking impl uses
         // fine grained chunking for the last say X% of work to avoid being hostage to stragglers
+        //
+        // Each mapping gets its own *shared* Arena: unmapping is done by Arena.close(), and it may
+        // be triggered by a thread other than the one that created the mapping (the "Ending
+        // Cleaner"), which a confined Arena would not allow.
 
         ///////////// The PUBLIC API
 
-        public MappedByteBuffer byteBuffer;
+        public MemorySegment segment;
         public long endAddress; // the virtual memory address corresponding to 'endInBuf'
         public int endInBuf; // where the chunk ends inside the buffer
         public long startAddress; // the virtual memory address corresponding to 'startInBuf'
@@ -194,9 +216,10 @@ public class CalculateAverage_vemanaNonIdiomatic {
 
         ///////////// Private State
 
+        private Arena arena; // owns 'segment'
         long bufferBaseAddr; // buffer's base virtual memory address
-        long extentEnd; // byteBuffer's ending coordinate
-        long extentStart; // byteBuffer's begin coordinate
+        long extentEnd; // mapping's ending coordinate
+        long extentStart; // mapping's begin coordinate
 
         // Uninitialized; for mutability
         public ByteRange(RandomAccessFile raf, long maxEndPos, int shardIdx) {
@@ -215,10 +238,10 @@ public class CalculateAverage_vemanaNonIdiomatic {
         public void close(String closerId) {
             Tracing.recordWorkStart(closerId, shardIdx);
             bufferCleanSlate();
-            for (MappedByteBuffer buf : unclosedBuffers) {
-                close(buf);
+            for (Arena a : unclosedArenas) {
+                a.close(); // unmaps
             }
-            unclosedBuffers.clear();
+            unclosedArenas.clear();
             Tracing.recordWorkEnd(closerId, shardIdx);
         }
 
@@ -252,65 +275,53 @@ public class CalculateAverage_vemanaNonIdiomatic {
         public String toString() {
             return """
                     ByteRange {
-                      shard                 = {shardIdx}
-                      extentStart           = {extentStart}
-                      extentEnd             = {extentEnd}
-                      startInBuf            = {startInBuf}
-                      endInBuf              = {endInBuf}
-                      startAddress          = {startAddress}
-                      endAddress            = {endAddress}
+                      shard                 = %d
+                      extentStart           = %d
+                      extentEnd             = %d
+                      startInBuf            = %d
+                      endInBuf              = %d
+                      startAddress          = %d
+                      endAddress            = %d
                     }
-                    """;
+                    """
+                    .formatted(shardIdx, extentStart, extentEnd, startInBuf, endInBuf, startAddress, endAddress);
         }
 
         private void bufferCleanSlate() {
-            if (byteBuffer != null) {
-                unclosedBuffers.add(byteBuffer);
-                byteBuffer = null;
+            if (arena != null) {
+                unclosedArenas.add(arena);
+                arena = null;
             }
+            segment = null;
             extentEnd = extentStart = bufferBaseAddr = startAddress = endAddress = -1;
         }
 
-        private void close(MappedByteBuffer buffer) {
-            Method cleanerMethod = Reflection.findMethodNamed(buffer, "cleaner");
-            cleanerMethod.setAccessible(true);
-            Object cleaner = Reflection.invoke(buffer, cleanerMethod);
-
-            Method cleanMethod = Reflection.findMethodNamed(cleaner, "clean");
-            cleanMethod.setAccessible(true);
-            Reflection.invoke(cleaner, cleanMethod);
-        }
-
-        private long getBaseAddr(MappedByteBuffer buffer) {
-            Method addressMethod = Reflection.findMethodNamed(buffer, "address");
-            addressMethod.setAccessible(true);
-            return (long) Reflection.invoke(buffer, addressMethod);
-        }
-
         private long nextNewLine(long pos) {
-            int nextPos = (int) (pos - extentStart);
-            while (byteBuffer.get(nextPos) != '\n') {
+            long nextPos = pos - extentStart;
+            while (segment.get(ValueLayout.JAVA_BYTE, nextPos) != '\n') {
                 nextPos++;
             }
             return nextPos + extentStart;
         }
 
         /**
-         * Extent different from Range. Range is what needs to be processed. Extent is what the byte
-         * buffer can read without failing.
+         * Extent different from Range. Range is what needs to be processed. Extent is what the
+         * mapping can read without failing.
          */
         private void setByteBufferExtent(long start, long end) {
             bufferCleanSlate();
+            Arena newArena = Arena.ofShared();
             try {
-                byteBuffer = raf.getChannel().map(MapMode.READ_ONLY, start, end - start);
-                byteBuffer.order(ByteOrder.nativeOrder());
+                segment = raf.getChannel().map(MapMode.READ_ONLY, start, end - start, newArena);
             }
             catch (IOException e) {
+                newArena.close();
                 throw new RuntimeException(e);
             }
+            arena = newArena;
             extentStart = start;
             extentEnd = end;
-            bufferBaseAddr = getBaseAddr(byteBuffer);
+            bufferBaseAddr = segment.address();
         }
     }
 
@@ -499,11 +510,12 @@ public class CalculateAverage_vemanaNonIdiomatic {
 
         public String toString() {
             return """
-                    min = {min()}
-                    max = {max()}
-                    count = {count()}
-                    sum = {sum()}
-                    """;
+                    min = %d
+                    max = %d
+                    count = %d
+                    sum = %d
+                    """
+                    .formatted(min(), max(), count(), sum());
         }
 
         public void update(short temperature) {
@@ -667,9 +679,10 @@ public class CalculateAverage_vemanaNonIdiomatic {
             }
             System.err.println(
                     """
-                            HashHits = {hashHits}
-                            HashMisses = {hashMisses} ({hashMisses * 100.0 / hashHits})
-                            """);
+                            HashHits = %d
+                            HashMisses = %d (%s)
+                            """
+                            .formatted(hashHits, hashMisses, hashMisses * 100.0 / hashHits));
             return new AggregateResult(map);
         }
 
@@ -716,27 +729,6 @@ public class CalculateAverage_vemanaNonIdiomatic {
         Optional<ByteRange> fileTailEndWork(int idx);
 
         ByteRange take(int shardIdx);
-    }
-
-    static final class Reflection {
-
-        static Method findMethodNamed(Object object, String name, Class... paramTypes) {
-            try {
-                return object.getClass().getMethod(name, paramTypes);
-            }
-            catch (NoSuchMethodException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
-        static Object invoke(Object receiver, Method method, Object... params) {
-            try {
-                return method.invoke(receiver, params);
-            }
-            catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
     }
 
     public static class Runner {
@@ -809,7 +801,7 @@ public class CalculateAverage_vemanaNonIdiomatic {
             // This particular sequence of Futures is so that both merge and munmap() can work as shards
             // finish their computation without blocking on the entire set of shards to complete. In
             // particular, munmap() doesn't need to wait on merge.
-            // First, submit a task to merge the results and then submit a task to cleanup bytebuffers
+            // First, submit a task to merge the results and then submit a task to cleanup mappings
             // from completed shards.
             Future<AggregateResult> resultFutures = executorService.submit(() -> merge(results));
             // Note that munmap() is serial and not parallel and hence we use just one thread.
@@ -1022,9 +1014,12 @@ public class CalculateAverage_vemanaNonIdiomatic {
                 }
 
                 long start = Math.max(pos - 512, 0);
-                ByteBuffer buf = raf.getChannel().map(MapMode.READ_ONLY, start, pos + 1 - start);
-                while (pos >= 0 && buf.get((int) (pos - start)) != '\n') {
-                    pos--;
+                // Short-lived mapping; unmapped deterministically when the arena closes.
+                try (Arena arena = Arena.ofConfined()) {
+                    MemorySegment buf = raf.getChannel().map(MapMode.READ_ONLY, start, pos + 1 - start, arena);
+                    while (pos >= 0 && buf.get(ValueLayout.JAVA_BYTE, pos - start) != '\n') {
+                        pos--;
+                    }
                 }
                 pos++;
                 return (int) (raf.length() - pos);
@@ -1477,7 +1472,7 @@ public class CalculateAverage_vemanaNonIdiomatic {
         }
 
         private static void printEvent(String message, long nanoTime) {
-            errPrint("%s = {(nanoTime - startTime) / 1_000_000}ms".formatted(message));
+            errPrint("%s = %dms".formatted(message, (nanoTime - startTime) / 1_000_000));
         }
 
         public static class ThreadTimingsArray {
@@ -1527,20 +1522,31 @@ public class CalculateAverage_vemanaNonIdiomatic {
                 }
                 return """
                         -------------------------------------------------------------------------------------------
-                                                       {id} Stats
+                                                       %s Stats
                         -------------------------------------------------------------------------------------------
-                        Max duration                              = {maxDuration / 1_000_000} ms
-                        Min duration                              = {minDuration / 1_000_000} ms
-                        Timespan[max(end)-min(start)]             = {(maxCompletion - minBegin) / 1_000_000} ms [{maxCompletion / 1_000_000} - {minBegin / 1_000_000} ]
-                        Completion Timespan[max(end)-min(end)]    = {(maxCompletion - minCompletion) / 1_000_000} ms
-                        Begin Timespan[max(begin)-min(begin)]     = {(maxBegin - minBegin) / 1_000_000} ms
-                        Average Duration                          = {Arrays.stream(durationsMs)
-                                                                            .average()
-                                                                            .getAsDouble()} ms
-                        Durations                                 = {toString(durationsMs)} ms
-                        Begin Timestamps                          = {toString(beginMs)} ms
-                        Completion Timestamps                     = {toString(completionsMs)} ms
-                        """;
+                        Max duration                              = %d ms
+                        Min duration                              = %d ms
+                        Timespan[max(end)-min(start)]             = %d ms [%d - %d ]
+                        Completion Timespan[max(end)-min(end)]    = %d ms
+                        Begin Timespan[max(begin)-min(begin)]     = %d ms
+                        Average Duration                          = %s ms
+                        Durations                                 = %s ms
+                        Begin Timestamps                          = %s ms
+                        Completion Timestamps                     = %s ms
+                        """
+                        .formatted(
+                                id,
+                                maxDuration / 1_000_000,
+                                minDuration / 1_000_000,
+                                (maxCompletion - minBegin) / 1_000_000,
+                                maxCompletion / 1_000_000,
+                                minBegin / 1_000_000,
+                                (maxCompletion - minCompletion) / 1_000_000,
+                                (maxBegin - minBegin) / 1_000_000,
+                                Arrays.stream(durationsMs).average().getAsDouble(),
+                                toString(durationsMs),
+                                toString(beginMs),
+                                toString(completionsMs));
             }
 
             public void recordEnd(int idx) {
@@ -1555,18 +1561,38 @@ public class CalculateAverage_vemanaNonIdiomatic {
         }
     }
 
+    /**
+     * Raw-address memory access, formerly backed by {@code sun.misc.Unsafe}.
+     *
+     * <p>{@code ALL} is a zero-based segment spanning the whole address space, so an absolute
+     * address can be passed straight in as the "offset". That keeps the rest of the program's
+     * address arithmetic unchanged. It is a {@code static final}, so the JIT can constant-fold the
+     * segment and compile each access down to a plain load/store plus a trivial bounds check.
+     *
+     * <p>Like Unsafe, this gives no protection: reading an address whose mapping has been closed
+     * will crash the JVM. The program only closes a mapping after its shard is finished with it.
+     */
     static class Unsafely {
 
-        private static final Unsafe unsafe = getUnsafe();
+        // reinterpret() is a restricted method: run with --enable-native-access=ALL-UNNAMED
+        private static final MemorySegment ALL = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
+
+        // JAVA_* layouts use native byte order, which the SWAR code relies on (little-endian).
+        private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+        private static final ValueLayout.OfShort SHORT = ValueLayout.JAVA_SHORT_UNALIGNED;
+        private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED;
+        private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
 
         public static long allocateZeroedCacheLineAligned(int size) {
-            long address = unsafe.allocateMemory(size + 63);
-            unsafe.setMemory(address, size + 63, (byte) 0);
-            return (address + 63) & ~63;
+            // Arena.allocate() zero-fills and honours the alignment, so no manual over-allocation or
+            // rounding is needed. The global arena is never freed, matching the original behaviour
+            // (tables live for the whole run) and, importantly, keeping the memory valid even
+            // though we only hold a raw address and the JIT may consider the segment unreachable.
+            return Arena.global().allocate(size, 64).address();
         }
 
         public static void copyMemory(long srcAddress, long destAddress, long byteCount) {
-            unsafe.copyMemory(srcAddress, destAddress, byteCount);
+            MemorySegment.copy(ALL, srcAddress, ALL, destAddress, byteCount);
         }
 
         public static boolean matches(long srcAddr, long destAddress, int len) {
@@ -1613,42 +1639,31 @@ public class CalculateAverage_vemanaNonIdiomatic {
         }
 
         public static byte readByte(long address) {
-            return unsafe.getByte(address);
+            return ALL.get(BYTE, address);
         }
 
         public static int readInt(long address) {
-            return unsafe.getInt(address);
+            return ALL.get(INT, address);
         }
 
         public static long readLong(long address) {
-            return unsafe.getLong(address);
+            return ALL.get(LONG, address);
         }
 
         public static short readShort(long address) {
-            return unsafe.getShort(address);
+            return ALL.get(SHORT, address);
         }
 
-        public static void setByte(long address, byte len) {
-            unsafe.putByte(address, len);
+        public static void setByte(long address, byte value) {
+            ALL.set(BYTE, address, value);
         }
 
         public static void setInt(long address, int value) {
-            unsafe.putInt(address, value);
+            ALL.set(INT, address, value);
         }
 
-        public static void setShort(long address, short len) {
-            unsafe.putShort(address, len);
-        }
-
-        private static Unsafe getUnsafe() {
-            try {
-                Field unsafeField = Unsafe.class.getDeclaredField("theUnsafe");
-                unsafeField.setAccessible(true);
-                return (Unsafe) unsafeField.get(null);
-            }
-            catch (NoSuchFieldException | IllegalAccessException e) {
-                throw new RuntimeException(e);
-            }
+        public static void setShort(long address, short value) {
+            ALL.set(SHORT, address, value);
         }
     }
 }

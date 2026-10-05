@@ -17,7 +17,6 @@ package dev.morling.onebrc;
 
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorSpecies;
-import sun.misc.Unsafe;
 
 import java.io.IOException;
 import java.lang.foreign.*;
@@ -31,12 +30,22 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.stream.IntStream;
 
+/**
+ * Java 27 notes:
+ * <ul>
+ * <li>sun.misc.Unsafe memory-access methods are no longer used. They throw UnsupportedOperationException by default
+ * since JDK 26 (JEP 498) and are slated for removal. All raw memory access now goes through {@link #ALL}.</li>
+ * <li>Compile with: javac --add-modules jdk.incubator.vector</li>
+ * <li>Run with: java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED</li>
+ * </ul>
+ */
 public class CalculateAverage_linl33 {
     private static final String FILE_PATH_PROPERTY = "dev.morling.onebrc.CalculateAverage_linl33.measurementsPath";
     private static final int WEATHER_STATION_LENGTH_MAX = 100;
     private static final long WEATHER_STATION_DISTINCT_MAX = 10_000L;
     private static final int N_THREADS = Runtime.getRuntime().availableProcessors();
 
+    // zero-based segment spanning the whole address space, so an absolute address can be used as the offset
     private static final MemorySegment ALL = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED;
 
@@ -45,8 +54,6 @@ public class CalculateAverage_linl33 {
             .name("1brc-CalculateAverage-", 0)
             .inheritInheritableThreadLocals(false);
 
-    private static final Unsafe UNSAFE;
-
     static {
         if (ByteOrder.nativeOrder() != ByteOrder.LITTLE_ENDIAN) {
             throw new UnsupportedOperationException("Error: BE JVMs are not supported");
@@ -54,15 +61,28 @@ public class CalculateAverage_linl33 {
         if ((BYTE_SPECIES.vectorByteSize() & (BYTE_SPECIES.vectorByteSize() - 1)) != 0) {
             throw new UnsupportedOperationException("Unsupported vectorByteSize %s".formatted(BYTE_SPECIES.vectorByteSize()));
         }
+    }
 
-        try {
-            var f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            UNSAFE = (Unsafe) f.get(null);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
+    // ---- raw memory access (replacement for sun.misc.Unsafe) ----
+
+    private static byte getByte(final long address) {
+        return ALL.get(ValueLayout.JAVA_BYTE, address);
+    }
+
+    private static int getInt(final long address) {
+        return ALL.get(ValueLayout.JAVA_INT_UNALIGNED, address);
+    }
+
+    private static long getLong(final long address) {
+        return ALL.get(ValueLayout.JAVA_LONG_UNALIGNED, address);
+    }
+
+    private static void putInt(final long address, final int value) {
+        ALL.set(ValueLayout.JAVA_INT_UNALIGNED, address, value);
+    }
+
+    private static void putLong(final long address, final long value) {
+        ALL.set(ValueLayout.JAVA_LONG_UNALIGNED, address, value);
     }
 
     public static void main() throws InterruptedException, IOException {
@@ -111,8 +131,8 @@ public class CalculateAverage_linl33 {
 
         for (int i = 0; i < weatherStations.length; i++) {
             final var offset = temperatureMeasurements.getOffset(i);
-            final var nameAddr = UNSAFE.getLong(offset);
-            final var nameLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
+            final var nameAddr = getLong(offset);
+            final var nameLength = getInt(offset + Integer.BYTES * 7);
             MemorySegment.copy(ALL, ValueLayout.JAVA_BYTE, nameAddr, nameBuffer, 0, nameLength);
             final var nameStr = new String(nameBuffer, 0, nameLength, StandardCharsets.UTF_8);
             weatherStations[i] = new AggregatedMeasurement(nameStr, i);
@@ -143,8 +163,8 @@ public class CalculateAverage_linl33 {
         System.out.print('/');
 
         // mean
-        final double total = UNSAFE.getLong(offset + Integer.BYTES * 2);
-        final var count = UNSAFE.getInt(offset + Integer.BYTES * 4);
+        final double total = getLong(offset + Integer.BYTES * 2);
+        final var count = getInt(offset + Integer.BYTES * 4);
         System.out.print(round(total / count / 10d));
         System.out.print('/');
 
@@ -153,7 +173,7 @@ public class CalculateAverage_linl33 {
     }
 
     private static void printAsDouble(final long addr) {
-        final var val = (double) UNSAFE.getInt(addr);
+        final var val = (double) getInt(addr);
         System.out.print(val / 10d);
     }
 
@@ -188,7 +208,7 @@ public class CalculateAverage_linl33 {
             var lineStart = this.chunkBounds[0];
             // walk back to find the previous '\n' and use it as lineStart
             for (long i = this.chunkStart - 1; i > this.chunkBounds[0]; i--) {
-                if (UNSAFE.getByte(i) == (byte) '\n') {
+                if (getByte(i) == (byte) '\n') {
                     lineStart = i + 1L;
                     break;
                 }
@@ -221,7 +241,7 @@ public class CalculateAverage_linl33 {
                                           final long start,
                                           final long end) {
             for (long i = start; i < end; i++) {
-                final var b = UNSAFE.getByte(i);
+                final var b = getByte(i);
                 if (b != (byte) '\n') {
                     continue;
                 }
@@ -236,7 +256,7 @@ public class CalculateAverage_linl33 {
             // the temperature is formatted to 1 decimal place
             // therefore the shortest temperature value is 0.0
             // so there are always at least 5 bytes between the location name and '\n'
-            final var trailing5Bytes = UNSAFE.getLong(lfAddress - 5);
+            final var trailing5Bytes = getLong(lfAddress - 5);
             final int trailingDWordRaw = (int) (trailing5Bytes >>> 8);
 
             // select the low nibble for each byte, '0'-'9' -> 0-9, ';' -> 11, '-' -> 13
@@ -299,7 +319,7 @@ public class CalculateAverage_linl33 {
         }
 
         public long getOffset(final long index) {
-            return UNSAFE.getLong(this.denseAddress + index * DENSE_SCALE);
+            return getLong(this.denseAddress + index * DENSE_SCALE);
         }
 
         public void putEntry(final long keyAddress, final int keyLength, final int value) {
@@ -317,7 +337,7 @@ public class CalculateAverage_linl33 {
             final var sparseOffset = this.sparseAddress + truncateHash(hash) * SPARSE_SCALE;
 
             for (long n = 0, sparseLinearOffset = sparseOffset; n < WEATHER_STATION_DISTINCT_MAX; n++, sparseLinearOffset += SPARSE_SCALE) {
-                final var entryKeyAddress = UNSAFE.getLong(sparseLinearOffset);
+                final var entryKeyAddress = getLong(sparseLinearOffset);
 
                 if (entryKeyAddress == 0L) {
                     this.add(sparseLinearOffset, keyAddress, keyLength, temperature, count, temperatureMin, temperatureMax);
@@ -329,20 +349,20 @@ public class CalculateAverage_linl33 {
                     continue;
                 }
 
-                final var currMin = UNSAFE.getInt(sparseLinearOffset + Integer.BYTES * 5);
-                final var currMax = UNSAFE.getInt(sparseLinearOffset + Integer.BYTES * 6);
-                final var currTotal = UNSAFE.getLong(sparseLinearOffset + Integer.BYTES * 2);
-                final var currCount = UNSAFE.getInt(sparseLinearOffset + Integer.BYTES * 4);
+                final var currMin = getInt(sparseLinearOffset + Integer.BYTES * 5);
+                final var currMax = getInt(sparseLinearOffset + Integer.BYTES * 6);
+                final var currTotal = getLong(sparseLinearOffset + Integer.BYTES * 2);
+                final var currCount = getInt(sparseLinearOffset + Integer.BYTES * 4);
 
-                UNSAFE.putLong(sparseLinearOffset + Integer.BYTES * 2, currTotal + temperature);
-                UNSAFE.putInt(sparseLinearOffset + Integer.BYTES * 4, currCount + count);
+                putLong(sparseLinearOffset + Integer.BYTES * 2, currTotal + temperature);
+                putInt(sparseLinearOffset + Integer.BYTES * 4, currCount + count);
 
                 if (temperatureMin < currMin) {
-                    UNSAFE.putInt(sparseLinearOffset + Integer.BYTES * 5, temperatureMin);
+                    putInt(sparseLinearOffset + Integer.BYTES * 5, temperatureMin);
                 }
 
                 if (temperatureMax > currMax) {
-                    UNSAFE.putInt(sparseLinearOffset + Integer.BYTES * 6, temperatureMax);
+                    putInt(sparseLinearOffset + Integer.BYTES * 6, temperatureMax);
                 }
 
                 return;
@@ -354,18 +374,18 @@ public class CalculateAverage_linl33 {
             for (long i = 0; i < otherSize; i++) {
                 final var offset = other.getOffset(i);
 
-                final var keyAddress = UNSAFE.getLong(offset);
-                final var keyLength = UNSAFE.getInt(offset + Integer.BYTES * 7);
+                final var keyAddress = getLong(offset);
+                final var keyLength = getInt(offset + Integer.BYTES * 7);
                 final var hash = hash(keyAddress, keyLength);
 
                 this.putEntryInternal(
                         hash,
                         keyAddress,
                         keyLength,
-                        UNSAFE.getLong(offset + Integer.BYTES * 2),
-                        UNSAFE.getInt(offset + Integer.BYTES * 4),
-                        UNSAFE.getInt(offset + Integer.BYTES * 5),
-                        UNSAFE.getInt(offset + Integer.BYTES * 6));
+                        getLong(offset + Integer.BYTES * 2),
+                        getInt(offset + Integer.BYTES * 4),
+                        getInt(offset + Integer.BYTES * 5),
+                        getInt(offset + Integer.BYTES * 6));
             }
         }
 
@@ -378,14 +398,14 @@ public class CalculateAverage_linl33 {
                          final int temperatureMax) {
             // new entry, initialize sparse and dense
             final var denseOffset = this.denseAddress + this.size * DENSE_SCALE;
-            UNSAFE.putLong(denseOffset, sparseOffset);
+            putLong(denseOffset, sparseOffset);
 
-            UNSAFE.putLong(sparseOffset, keyAddress);
-            UNSAFE.putLong(sparseOffset + Integer.BYTES * 2, temperature);
-            UNSAFE.putInt(sparseOffset + Integer.BYTES * 4, count);
-            UNSAFE.putInt(sparseOffset + Integer.BYTES * 5, temperatureMin);
-            UNSAFE.putInt(sparseOffset + Integer.BYTES * 6, temperatureMax);
-            UNSAFE.putInt(sparseOffset + Integer.BYTES * 7, keyLength);
+            putLong(sparseOffset, keyAddress);
+            putLong(sparseOffset + Integer.BYTES * 2, temperature);
+            putInt(sparseOffset + Integer.BYTES * 4, count);
+            putInt(sparseOffset + Integer.BYTES * 5, temperatureMin);
+            putInt(sparseOffset + Integer.BYTES * 6, temperatureMax);
+            putInt(sparseOffset + Integer.BYTES * 7, keyLength);
         }
 
         private static boolean mismatch(final long leftAddr, final long rightAddr, final int length) {
@@ -413,7 +433,7 @@ public class CalculateAverage_linl33 {
         // Use the leading and trailing few bytes as hash
         // this performs better than computing a good hash
         private static long hash(final long keyAddress, final int keyLength) {
-            final var leadingQWord = UNSAFE.getLong(keyAddress);
+            final var leadingQWord = getLong(keyAddress);
             // the constant is the 64 bit FNV-1 offset basis
             final var hash = -3750763034362895579L ^ leadingQWord;
             if (keyLength < Integer.BYTES) {
@@ -421,7 +441,7 @@ public class CalculateAverage_linl33 {
                 return hash & 0xffffL;
             }
             else {
-                final var trailingDWord = UNSAFE.getLong(keyAddress + keyLength - Integer.BYTES) & 0xffffffffL;
+                final var trailingDWord = getLong(keyAddress + keyLength - Integer.BYTES) & 0xffffffffL;
                 // only the lower dword in hash is guaranteed to exist so shift left 32
                 return (hash << Integer.SIZE) ^ trailingDWord;
             }

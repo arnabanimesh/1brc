@@ -15,23 +15,34 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
-import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.lang.reflect.Field;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.TreeMap;
 import java.util.stream.IntStream;
 
+/**
+ * Java 22+ (FFM API final) version. No sun.misc.Unsafe, so it runs on JDK 26/27 where the
+ * Unsafe memory-access methods throw UnsupportedOperationException by default.
+ */
 public class CalculateAverage_roman_r_m {
 
     private static final String FILE = "./measurements.txt";
 
-    private static Unsafe UNSAFE;
+    // The word-at-a-time tricks below assume little-endian byte order, so pin it explicitly.
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+
+    // Lines starting before (segmentSize - SAFE_TAIL) can be parsed with 8-byte reads that never leave the segment
+    // (a line is at most ~107 bytes). The last few lines are copied into a zero-padded buffer and parsed from there.
+    private static final long SAFE_TAIL = 128;
+    private static final long TAIL_PADDING = 16;
 
     private static long broadcast(byte b) {
         return 0x101010101010101L * b;
@@ -55,14 +66,21 @@ public class CalculateAverage_roman_r_m {
     }
 
     static long nextNewline(long from, MemorySegment ms) {
-        long start = from;
-        long i;
-        long next = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, start);
-        while ((i = applyPattern(next, LINE_END_MASK)) == 0) {
-            start += 8;
-            next = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, start);
+        long size = ms.byteSize();
+        long pos = from;
+        while (pos + 8 <= size) {
+            long i = applyPattern(ms.get(LONG_LE, pos), LINE_END_MASK);
+            if (i != 0) {
+                return pos + Long.numberOfTrailingZeros(i) / 8;
+            }
+            pos += 8;
         }
-        return start + Long.numberOfTrailingZeros(i) / 8;
+        for (; pos < size; pos++) {
+            if (ms.get(BYTE, pos) == '\n') {
+                return pos;
+            }
+        }
+        throw new IllegalStateException("No newline found after offset " + from);
     }
 
     static int hashFull(long word) {
@@ -74,129 +92,147 @@ public class CalculateAverage_roman_r_m {
         return (int) (h ^ (h >>> 32));
     }
 
-    public static void main(String[] args) throws Exception {
-        Field f = Unsafe.class.getDeclaredField("theUnsafe");
-        f.setAccessible(true);
-        UNSAFE = (Unsafe) f.get(null);
-
-        long fileSize = new File(FILE).length();
-
-        var channel = FileChannel.open(Paths.get(FILE));
-        MemorySegment ms = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.ofConfined());
-
-        int numThreads = fileSize > Integer.MAX_VALUE ? Runtime.getRuntime().availableProcessors() : 1;
+    private static long[] chunkBounds(FileChannel channel, long fileSize, int numThreads) throws IOException {
         long chunk = fileSize / numThreads;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment whole = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, arena);
+            return IntStream.range(0, numThreads)
+                    .mapToLong(i -> i == numThreads - 1 ? fileSize : nextNewline((i + 1) * chunk, whole))
+                    .toArray();
+        }
+    }
 
-        var bounds = IntStream.range(0, numThreads).mapToLong(i -> {
-            boolean lastChunk = i == numThreads - 1;
-            return lastChunk ? fileSize : nextNewline((i + 1) * chunk, ms);
-        }).toArray();
+    public static void main(String[] args) throws Exception {
+        try (var channel = FileChannel.open(Paths.get(FILE))) {
+            long fileSize = channel.size();
 
-        ms.unload();
+            int numThreads = fileSize > Integer.MAX_VALUE ? Runtime.getRuntime().availableProcessors() : 1;
+            long[] bounds = chunkBounds(channel, fileSize, numThreads);
 
-        var result = IntStream.range(0, numThreads)
-                .parallel()
-                .mapToObj(i -> {
-                    try {
+            var result = IntStream.range(0, numThreads)
+                    .parallel()
+                    .mapToObj(i -> {
                         long segmentStart = i == 0 ? 0 : bounds[i - 1] + 1;
                         long segmentEnd = bounds[i];
-                        var segment = channel.map(FileChannel.MapMode.READ_ONLY, segmentStart, segmentEnd - segmentStart, Arena.ofConfined());
+                        return processChunk(channel, segmentStart, segmentEnd - segmentStart);
+                    })
+                    .reduce((m1, m2) -> {
+                        m2.forEach((k, v) -> m1.merge(k, v, ResultRow::merge));
+                        return m1;
+                    })
+                    .orElseThrow();
 
-                        var resultStore = new ResultStore();
-                        var station = new ByteString(segment);
-                        long offset = segment.address();
-                        long end = offset + segment.byteSize();
-                        long tailMask;
-                        while (offset < end) {
-                            // parsing station name
-                            long start = offset;
-                            long next = UNSAFE.getLong(offset);
-                            long pattern = applyPattern(next, SEMICOLON_MASK);
-                            int bytes;
-                            if (pattern == 0) {
-                                station.hash = hashFull(next);
-                                do {
-                                    offset += 8;
-                                    next = UNSAFE.getLong(offset);
-                                    pattern = applyPattern(next, SEMICOLON_MASK);
-                                } while (pattern == 0);
+            System.out.println(result);
+        }
+    }
 
-                                bytes = Long.numberOfTrailingZeros(pattern) / 8;
-                                offset += bytes;
-                                tailMask = ((1L << (8 * bytes)) - 1);
-                            }
-                            else {
-                                bytes = Long.numberOfTrailingZeros(pattern) / 8;
-                                offset += bytes;
-                                tailMask = ((1L << (8 * bytes)) - 1);
+    private static TreeMap<String, ResultRow> processChunk(FileChannel channel, long start, long length) {
+        // The arena must stay open until toMap(): the stored keys point into the mapped (and tail) memory.
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment segment = channel.map(FileChannel.MapMode.READ_ONLY, start, length, arena);
+            var resultStore = new ResultStore();
+            long size = segment.byteSize();
 
-                                station.hash = hashPartial(next, bytes);
-                            }
+            long offset = processLines(segment, 0, size - SAFE_TAIL, size, resultStore);
 
-                            int len = (int) (offset - start);
-                            station.offset = start;
-                            station.len = len;
-                            station.tail = next & tailMask;
+            if (offset < size) {
+                long remaining = size - offset;
+                MemorySegment tail = arena.allocate(remaining + TAIL_PADDING); // zero-initialized
+                MemorySegment.copy(segment, offset, tail, 0, remaining);
+                processLines(tail, 0, remaining, remaining, resultStore);
+            }
 
-                            offset++;
+            return resultStore.toMap();
+        }
+        catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
 
-                            // parsing temperature
-                            // TODO next may contain temperature as well, maybe try using it if we know the full number is there
-                            // 8 - bytes >= 5 -> bytes <= 3
-                            long val;
-                            if (end - offset >= 8) {
-                                long encodedVal = UNSAFE.getLong(offset);
+    /**
+     * Parses lines starting at {@code offset} for as long as the line start is below {@code limit}.
+     * {@code end} is the real end of the data in {@code ms}. Returns the offset of the first unparsed line.
+     */
+    private static long processLines(MemorySegment ms, long offset, long limit, long end, ResultStore resultStore) {
+        var station = new ByteString(ms);
+        while (offset < limit) {
+            // parsing station name
+            long start = offset;
+            long next = ms.get(LONG_LE, offset);
+            long pattern = applyPattern(next, SEMICOLON_MASK);
+            int bytes;
+            long tailMask;
+            if (pattern == 0) {
+                station.hash = hashFull(next);
+                do {
+                    offset += 8;
+                    next = ms.get(LONG_LE, offset);
+                    pattern = applyPattern(next, SEMICOLON_MASK);
+                } while (pattern == 0);
 
-                                int neg = 1 - Integer.bitCount((int) (encodedVal & 0x10));
-                                encodedVal >>>= 8 * neg;
+                bytes = Long.numberOfTrailingZeros(pattern) / 8;
+                offset += bytes;
+                tailMask = ((1L << (8 * bytes)) - 1);
+            }
+            else {
+                bytes = Long.numberOfTrailingZeros(pattern) / 8;
+                offset += bytes;
+                tailMask = ((1L << (8 * bytes)) - 1);
 
-                                long numLen = applyPattern(encodedVal, DOT_MASK);
-                                numLen = Long.numberOfTrailingZeros(numLen) / 8;
+                station.hash = hashPartial(next, bytes);
+            }
 
-                                encodedVal ^= ZEROES_MASK;
+            int len = (int) (offset - start);
+            station.offset = start;
+            station.len = len;
+            station.tail = next & tailMask;
 
-                                int intPart = (int) (encodedVal & ((1 << (8 * numLen)) - 1));
-                                intPart <<= 8 * (2 - numLen);
-                                intPart *= (100 * 256 + 10);
-                                intPart = (intPart & 0x3FF80) >>> 8;
+            offset++;
 
-                                int frac = (int) ((encodedVal >>> (8 * (numLen + 1))) & 0xFF);
+            // parsing temperature
+            // TODO next may contain temperature as well, maybe try using it if we know the full number is there
+            // 8 - bytes >= 5 -> bytes <= 3
+            long val;
+            if (end - offset >= 8) {
+                long encodedVal = ms.get(LONG_LE, offset);
 
-                                offset += neg + numLen + 3; // 1 for . + 1 for fractional part + 1 for new line char
-                                int sign = 1 - 2 * neg;
-                                val = sign * (intPart + frac);
-                            }
-                            else {
-                                int neg = 1 - Integer.bitCount(UNSAFE.getByte(offset) & 0x10);
-                                offset += neg;
+                int neg = 1 - Integer.bitCount((int) (encodedVal & 0x10));
+                encodedVal >>>= 8 * neg;
 
-                                val = UNSAFE.getByte(offset++) - '0';
-                                byte b;
-                                while ((b = UNSAFE.getByte(offset++)) != '.') {
-                                    val = val * 10 + (b - '0');
-                                }
-                                b = UNSAFE.getByte(offset);
-                                val = val * 10 + (b - '0');
-                                offset += 2;
-                                val *= 1 - (2L * neg);
-                            }
+                long numLen = applyPattern(encodedVal, DOT_MASK);
+                numLen = Long.numberOfTrailingZeros(numLen) / 8;
 
-                            resultStore.update(station, (int) val);
-                        }
+                encodedVal ^= ZEROES_MASK;
 
-                        segment.unload();
+                int intPart = (int) (encodedVal & ((1 << (8 * numLen)) - 1));
+                intPart <<= 8 * (2 - numLen);
+                intPart *= (100 * 256 + 10);
+                intPart = (intPart & 0x3FF80) >>> 8;
 
-                        return resultStore.toMap();
-                    }
-                    catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                }).reduce((m1, m2) -> {
-                    m2.forEach((k, v) -> m1.merge(k, v, ResultRow::merge));
-                    return m1;
-                });
+                int frac = (int) ((encodedVal >>> (8 * (numLen + 1))) & 0xFF);
 
-        System.out.println(result.get());
+                offset += neg + numLen + 3; // 1 for . + 1 for fractional part + 1 for new line char
+                int sign = 1 - 2 * neg;
+                val = sign * (intPart + frac);
+            }
+            else {
+                int neg = 1 - Integer.bitCount(ms.get(BYTE, offset) & 0x10);
+                offset += neg;
+
+                val = ms.get(BYTE, offset++) - '0';
+                byte b;
+                while ((b = ms.get(BYTE, offset++)) != '.') {
+                    val = val * 10 + (b - '0');
+                }
+                b = ms.get(BYTE, offset);
+                val = val * 10 + (b - '0');
+                offset += 2;
+                val *= 1 - (2L * neg);
+            }
+
+            resultStore.update(station, (int) val);
+        }
+        return offset;
     }
 
     static final class ByteString {
@@ -212,8 +248,8 @@ public class CalculateAverage_roman_r_m {
         }
 
         public String asString(byte[] reusable) {
-            UNSAFE.copyMemory(null, offset, reusable, Unsafe.ARRAY_BYTE_BASE_OFFSET, len);
-            return new String(reusable, 0, len);
+            MemorySegment.copy(ms, ValueLayout.JAVA_BYTE, offset, reusable, 0, len);
+            return new String(reusable, 0, len, StandardCharsets.UTF_8);
         }
 
         public ByteString copy() {
@@ -238,8 +274,8 @@ public class CalculateAverage_roman_r_m {
                 return false;
 
             for (int i = 0; i + 7 < len; i += 8) {
-                long l1 = UNSAFE.getLong(offset + i);
-                long l2 = UNSAFE.getLong(that.offset + i);
+                long l1 = ms.get(LONG_LE, offset + i);
+                long l2 = that.ms.get(LONG_LE, that.offset + i);
                 if (l1 != l2) {
                     return false;
                 }

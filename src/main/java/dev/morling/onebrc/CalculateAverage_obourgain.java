@@ -15,13 +15,13 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.lang.reflect.Field;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -31,15 +31,18 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
+/**
+ * Java 27 compatible version: no sun.misc.Unsafe (its memory-access methods are terminally deprecated
+ * and throw by default on recent JDKs) and no restricted FFM methods (e.g. MemorySegment::reinterpret),
+ * so it runs without any --add-opens / --enable-native-access / --sun-misc-unsafe-memory-access flag.
+ * Memory is accessed through the standard FFM API (final since JDK 22) and byte[] view VarHandles (JDK 9+).
+ */
 public class CalculateAverage_obourgain {
 
     private static final String FILE = "./measurements.txt";
-
-    private static final boolean USE_UNSAFE = true;
 
     static class ThreadLocalState {
         private final OpenAddressingMap resultMap = new OpenAddressingMap();
@@ -50,34 +53,18 @@ public class CalculateAverage_obourgain {
     public static final int PER_THREAD_MAP_CAPACITY = 65536;
     public static final int MASK = PER_THREAD_MAP_CAPACITY - 1;
 
-    // needed ony without unsafe
-    // public static final int MOST_SIGNIFICANT_BIT_SET = 0x80808080;
-    // public static final int SUBTRACT_0_FROM_EACH_BYTE_IN_INT = 0x30303030;
-    // private static final ValueLayout.OfInt BIG_ENDIAN_INTEGER_UNALIGNED = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
+    // Reading with an explicit byte order makes the code independent of the platform endianness. On little-endian CPUs the JIT turns this into a plain load + bswap.
+    private static final ValueLayout.OfInt BIG_ENDIAN_INT_UNALIGNED = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN);
 
-    private static final Unsafe UNSAFE;
-    private static final int BYTE_ARRAY_OFFSET_BASE;
-    // TODO support big endian archis
-    public static final int MASK_3_BYTES = Integer.reverseBytes(16777215);
-    public static final int MASK_2_BYTES = Integer.reverseBytes(65535);
+    // Views on the byte[] used as a scratch buffer for the city name. Plain (non-atomic) access supports unaligned offsets.
+    private static final VarHandle BYTES_AS_INT_BIG_ENDIAN = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN);
+    // for equality checks only the byte order doesn't matter, so use the native one and skip the bswap
+    private static final VarHandle BYTES_AS_INT_NATIVE = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.nativeOrder());
+    private static final VarHandle BYTES_AS_LONG_NATIVE = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder());
 
-    static {
-        if (USE_UNSAFE) {
-            try {
-                Field field = Unsafe.class.getDeclaredField("theUnsafe");
-                field.setAccessible(true);
-                UNSAFE = (Unsafe) field.get(null);
-                BYTE_ARRAY_OFFSET_BASE = UNSAFE.arrayBaseOffset(byte[].class);
-            }
-            catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
-        else {
-            UNSAFE = null;
-            BYTE_ARRAY_OFFSET_BASE = -1;
-        }
-    }
+    // The int read from the file is always big-endian (first byte of the file in the most significant byte), whatever the platform
+    public static final int MASK_3_BYTES = 0xFFFFFF00;
+    public static final int MASK_2_BYTES = 0xFFFF0000;
 
     static class MeasurementAggregator {
         // deci-Celcius values
@@ -116,6 +103,7 @@ public class CalculateAverage_obourgain {
     public static void main(String[] args) throws Exception {
         // no close, leak everything and let the OS cleanup!
         var randomAccessFile = new RandomAccessFile(FILE, "r");
+        // FileChannel.map(..., Arena) is not a restricted method, no --enable-native-access needed
         MemorySegment segment = randomAccessFile.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, randomAccessFile.length(), Arena.global());
 
         // can we do better to balance across cpu cores?
@@ -155,7 +143,6 @@ public class CalculateAverage_obourgain {
         }
         sb.append('}');
         System.out.println(sb);
-        // System.out.println(COLLISIONS.get());
     }
 
     private static void printEntry(List<PrintableMeasurement> entries, int i, StringBuilder sb) {
@@ -194,7 +181,7 @@ public class CalculateAverage_obourgain {
     }
 
     static long getCityNameLength(MemorySegment segment, long position, ThreadLocalState threadLocalState) {
-        long cityNameLength = 0;
+        int cityNameLength = 0;
         int cityNameHashCode = 0;
         byte[] cityNameBuffer = threadLocalState.cityNameBuffer;
 
@@ -203,18 +190,13 @@ public class CalculateAverage_obourgain {
             // adding one for the semicolon, we know we can always read 4 bytes without worrying about reading out of bounds
             int i = readBigEndianInt(segment, position + cityNameLength);
 
-            // if (USE_UNSAFE) {
-            // put all four bytes at once, we'll use cityNameLength to not read past the actual end of the buffer
-            UNSAFE.putInt(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + cityNameLength, Integer.reverseBytes(i));
-            // }
+            // put all four bytes at once, we'll use cityNameLength to not read past the actual end of the name
+            BYTES_AS_INT_BIG_ENDIAN.set(cityNameBuffer, cityNameLength, i);
 
             byte b0 = (byte) (i >>> 24);
             if (b0 == ';') {
                 break;
             }
-            // if (!USE_UNSAFE) {
-            // cityNameBuffer[cityNameLength] = b0;
-            // }
 
             byte b1 = (byte) (i >>> 16);
             if (b1 == ';') {
@@ -222,9 +204,6 @@ public class CalculateAverage_obourgain {
                 cityNameLength += 1;
                 break;
             }
-            // if (!USE_UNSAFE) {
-            // cityNameBuffer[cityNameLength + 1] = b1;
-            // }
 
             byte b2 = (byte) (i >>> 8);
             if (b2 == ';') {
@@ -233,9 +212,6 @@ public class CalculateAverage_obourgain {
                 cityNameLength += 2;
                 break;
             }
-            // if (!USE_UNSAFE) {
-            // cityNameBuffer[cityNameLength + 2] = b2;
-            // }
 
             byte b3 = (byte) i;
             if (b3 == ';') {
@@ -244,13 +220,10 @@ public class CalculateAverage_obourgain {
                 cityNameLength += 3;
                 break;
             }
-            // if (!USE_UNSAFE) {
-            // cityNameBuffer[cityNameLength + 3] = b3;
-            // }
             cityNameHashCode = cityNameHashCode * 31 + i;
             cityNameLength += 4;
         }
-        return (cityNameLength << 32) | (cityNameHashCode & 0xffffffffL);
+        return ((long) cityNameLength << 32) | (cityNameHashCode & 0xffffffffL);
     }
 
     private static long decodeDouble(MemorySegment segment, long position, MeasurementAggregator perCityStats) {
@@ -295,22 +268,12 @@ public class CalculateAverage_obourgain {
     }
 
     private static int readBigEndianInt(MemorySegment segment, long position) {
-        // I had to comment the code as a static flag isn't enough for max perf, maybe because until the code is JIT-ed it is a lot slower to do the check in a hot loop
-        // if (USE_UNSAFE) {
-        // sadly, Unsafe is faster than reading via the MemorySegment API. For real production code, I would go with the safety of the bound checks, but here I need the boost
-        // Actually, the MemorySegment is a great improvement over unsafe for the developer experience, kudos
-        return Integer.reverseBytes(UNSAFE.getInt(segment.address() + position));
-        // } else {
-        // return segment.get(BIG_ENDIAN_INTEGER_UNALIGNED, position);
-        // }
+        // Bounds-checked read through the standard FFM API. It replaces the former Unsafe.getInt + Integer.reverseBytes.
+        return segment.get(BIG_ENDIAN_INT_UNALIGNED, position);
     }
 
     private static byte readByte(MemorySegment segment, long position) {
-        // if (USE_UNSAFE) {
-        return UNSAFE.getByte(segment.address() + position);
-        // } else {
-        // return segment.get(ValueLayout.JAVA_BYTE, position);
-        // }
+        return segment.get(ValueLayout.JAVA_BYTE, position);
     }
 
     static final class KeyWrapper implements Comparable<KeyWrapper> {
@@ -409,7 +372,8 @@ public class CalculateAverage_obourgain {
 
         public void forEach(final BiConsumer<byte[], MeasurementAggregator> consumer) {
             int remaining = size;
-            for (int i = 1, length = values.length; remaining > 0 && i < length; i++) {
+            // start at 0: slot 0 is a valid slot (the original started at 1 and could silently drop a city hashed there)
+            for (int i = 0, length = values.length; remaining > 0 && i < length; i++) {
                 MeasurementAggregator value = values[i];
                 if (null != value) {
                     consumer.accept(keys[i], value);
@@ -428,11 +392,9 @@ public class CalculateAverage_obourgain {
             MeasurementAggregator value;
             while (null != (value = values[keyIndex])) {
                 byte[] existingKey = keys[keyIndex];
-                if (existingKey.length == cityNameLength && arrayEquals(existingKey, cityNameBuffer, (byte) cityNameLength)) {
+                if (existingKey.length == cityNameLength && arrayEquals(existingKey, cityNameBuffer, cityNameLength)) {
                     return value;
                 }
-                // }
-                // COLLISIONS.incrementAndGet();
                 // go to next slot
                 keyIndex = (keyIndex + 1) & MASK;
             }
@@ -449,31 +411,26 @@ public class CalculateAverage_obourgain {
         }
     }
 
-    static final AtomicLong COLLISIONS = new AtomicLong();
-
-    static boolean arrayEquals(byte[] existingKey, byte[] cityNameBuffer, byte length) {
+    /**
+     * Compares the first {@code length} bytes of both arrays. Never reads past {@code length}
+     * (the former Unsafe version could read up to 7 bytes past the end of the key).
+     */
+    static boolean arrayEquals(byte[] existingKey, byte[] cityNameBuffer, int length) {
         int i = 0;
-        while (i != length) {
-            if (length >= 8) {
-                if (UNSAFE.getLong(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getLong(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + i)) {
-                    return false;
-                }
-                else {
-                    i += 8;
-                }
+        for (; i + 8 <= length; i += 8) {
+            if ((long) BYTES_AS_LONG_NATIVE.get(existingKey, i) != (long) BYTES_AS_LONG_NATIVE.get(cityNameBuffer, i)) {
+                return false;
             }
-            else if (length >= 4) {
-                if (UNSAFE.getInt(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getInt(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + i)) {
-                    return false;
-                }
-                else {
-                    i += 4;
-                }
+        }
+        if (i + 4 <= length) {
+            if ((int) BYTES_AS_INT_NATIVE.get(existingKey, i) != (int) BYTES_AS_INT_NATIVE.get(cityNameBuffer, i)) {
+                return false;
             }
-            for (; i < (long) length; ++i) {
-                if (UNSAFE.getByte(existingKey, BYTE_ARRAY_OFFSET_BASE + i) != UNSAFE.getByte(cityNameBuffer, BYTE_ARRAY_OFFSET_BASE + i)) {
-                    return false;
-                }
+            i += 4;
+        }
+        for (; i < length; i++) {
+            if (existingKey[i] != cityNameBuffer[i]) {
+                return false;
             }
         }
         return true;

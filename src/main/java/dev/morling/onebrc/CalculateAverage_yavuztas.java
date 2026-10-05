@@ -15,10 +15,10 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -34,20 +34,21 @@ public class CalculateAverage_yavuztas {
 
     private static final Path FILE = Path.of("./measurements.txt");
 
-    private static final Unsafe UNSAFE = unsafe();
+    // Port note: the original used sun.misc.Unsafe for raw memory access. Those memory-access methods are
+    // deprecated for removal (JEP 471/498), so all loads now go through the Foreign Function & Memory API
+    // (java.lang.foreign, final since Java 22). Nothing here is a restricted method, so no
+    // --enable-native-access or --sun-misc-unsafe-memory-access flags are needed.
+    //
+    // The algorithm assumes little-endian word layout (trailing-zero tricks); we state it explicitly so the
+    // result is also correct on big-endian hosts. On little-endian hosts this is a no-op.
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
-    // I compared all three: MappedByteBuffer, MemorySegment and Unsafe.
-    // Accessing the memory using Unsafe is still the fastest in my experience.
-    // However, I would never use it in production, single programming error will crash your app.
-    private static Unsafe unsafe() {
-        try {
-            final Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            return (Unsafe) f.get(null);
-        }
-        catch (Exception e) {
-            throw new RuntimeException(e);
-        }
+    // Word loads may read a few bytes past the end of a line (at most 7). MemorySegment is bounds-checked
+    // (Unsafe was not), so the last TAIL_MARGIN bytes of the file are processed from a zero-padded copy.
+    private static final int TAIL_MARGIN = 16;
+
+    private static long getWord(MemorySegment segment, long offset) {
+        return segment.get(LONG_LE, offset);
     }
 
     /**
@@ -61,7 +62,8 @@ public class CalculateAverage_yavuztas {
     // Only one object, both for measurements and keys, less object creation in hotpots is always faster
     private static final class Record {
 
-        private final long start; // memory address of the underlying data
+        private final MemorySegment segment; // segment holding the key bytes
+        private final long start; // offset of the key inside the segment
         private final int length;
         private final long word1;
         private final long word2;
@@ -74,7 +76,8 @@ public class CalculateAverage_yavuztas {
         private long sum;
         private int count;
 
-        public Record(long start, int length, long word1, long word2, long wordLast, int hash, int temp) {
+        public Record(MemorySegment segment, long start, int length, long word1, long word2, long wordLast, int hash, int temp) {
+            this.segment = segment;
             this.start = start;
             this.length = length;
             this.word1 = word1;
@@ -90,46 +93,36 @@ public class CalculateAverage_yavuztas {
         @Override
         public boolean equals(Object o) {
             final Record record = (Record) o;
-            return equals(record.start, record.word1, record.word2, record.wordLast, record.length);
+            return equals(record.segment, record.start, record.word1, record.word2, record.wordLast, record.length);
         }
 
-        private static boolean notEquals(long address1, long address2, int step) {
-            return UNSAFE.getLong(address1 + step) != UNSAFE.getLong(address2 + step);
-        }
-
-        private static boolean equalsComparingLongs(long start1, long start2, int length) {
-            // first shortcuts
-            if (length < 24)
-                return true;
-            if (length < 32)
-                return !notEquals(start1, start2, 16);
-
-            int step = 24; // starting from 3rd long
-            length -= step;
-            while (length >= 8) { // scan longs
-                if (notEquals(start1, start2, step)) {
+        // word1/word2 (bytes 0-15) and the masked last word are compared by the caller;
+        // this compares every full 8-byte word in between, starting at byte 16.
+        private static boolean middleEquals(MemorySegment segment1, long start1, MemorySegment segment2, long start2, int length) {
+            final int lastWordOffset = length & ~7;
+            for (int offset = 16; offset < lastWordOffset; offset += 8) {
+                if (getWord(segment1, start1 + offset) != getWord(segment2, start2 + offset)) {
                     return false;
                 }
-                length -= 8;
-                step += 8; // 8 bytes
             }
             return true;
         }
 
-        private boolean equals(long start, long word1, long word2, long last, int length) {
+        private boolean equals(MemorySegment segment, long start, long word1, long word2, long last, int length) {
             if (this.word1 != word1)
                 return false;
             if (this.word2 != word2)
                 return false;
+            if (this.wordLast != last)
+                return false;
 
             // equals check is done by comparing longs instead of byte by byte check, this is faster
-            return equalsComparingLongs(this.start, start, length) && this.wordLast == last;
+            return middleEquals(this.segment, this.start, segment, start, length);
         }
 
         @Override
         public String toString() {
-            final byte[] bytes = new byte[this.length];
-            UNSAFE.copyMemory(null, this.start, bytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, this.length);
+            final byte[] bytes = this.segment.asSlice(this.start, this.length).toArray(ValueLayout.JAVA_BYTE);
             return new String(bytes, StandardCharsets.UTF_8);
         }
 
@@ -186,15 +179,15 @@ public class CalculateAverage_yavuztas {
             return hash & BITMASK; // fast modulo, to find bucket
         }
 
-        private void putAndCollect(int hash, int temp, long start, int length, long word1, long word2, long wordLast) {
+        private void putAndCollect(MemorySegment segment, int hash, int temp, long start, int length, long word1, long word2, long wordLast) {
             final int bucket = hashBucket(hash);
             if (hasNoRecord(bucket)) {
-                this.keys[bucket] = new Record(start, length, word1, word2, wordLast, hash, temp);
+                this.keys[bucket] = new Record(segment, start, length, word1, word2, wordLast, hash, temp);
                 return;
             }
 
             Record existing = getRecord(bucket);
-            if (existing.equals(start, word1, word2, wordLast, length)) {
+            if (existing.equals(segment, start, word1, word2, wordLast, length)) {
                 existing.collect(temp);
                 return;
             }
@@ -202,14 +195,14 @@ public class CalculateAverage_yavuztas {
             // collision++;
             // find possible slot by scanning the slot linked list
             while (existing.next != null) {
-                if (existing.next.equals(start, word1, word2, wordLast, length)) {
+                if (existing.next.equals(segment, start, word1, word2, wordLast, length)) {
                     existing.next.collect(temp);
                     return;
                 }
                 existing = existing.next; // go on to next
                 // collision++;
             }
-            existing.next = new Record(start, length, word1, word2, wordLast, hash, temp);
+            existing.next = new Record(segment, start, length, word1, word2, wordLast, hash, temp);
         }
 
         private void putOrMerge(Record key) {
@@ -266,18 +259,16 @@ public class CalculateAverage_yavuztas {
     // One actor for one thread, no synchronization
     private static final class RegionActor extends Thread {
 
-        private final long startPos; // start of region memory address
-        private final int size;
+        private final MemorySegment segment;
+        private final long startPos; // start of the region, offset inside segment
+        private final long endPos; // end of the region (exclusive), always right after a line break
 
         private final RecordMap map = new RecordMap();
 
-        public RegionActor(long startPos, int size) {
+        public RegionActor(MemorySegment segment, long startPos, long endPos) {
+            this.segment = segment;
             this.startPos = startPos;
-            this.size = size;
-        }
-
-        private static long getWord(long address) {
-            return UNSAFE.getLong(address);
+            this.endPos = endPos;
         }
 
         // hasvalue & haszero
@@ -300,37 +291,38 @@ public class CalculateAverage_yavuztas {
 
         @Override
         public void run() {
+            final MemorySegment segment = this.segment; // local copy helps the JIT hoist checks
             long pointer = this.startPos;
-            final long size = pointer + this.size;
-            while (pointer < size) { // line start
+            final long end = this.endPos;
+            while (pointer < end) { // line start
                 long hash = 0; // reset hash
                 long s; // semicolon check word
                 final int pos; // semicolon position
-                long word1 = getWord(pointer);
+                long word1 = getWord(segment, pointer);
                 if ((s = hasSemicolon(word1)) != 0) {
                     pos = semicolonPos(s);
                     // read temparature
-                    final long numberWord = getWord(pointer + pos + 1);
+                    final long numberWord = getWord(segment, pointer + pos + 1);
                     final int decimalPos = decimalPos(numberWord);
                     final int temp = convertIntoNumber(decimalPos, numberWord);
 
                     word1 = partial(word1, pos); // last word
-                    this.map.putAndCollect(completeHash(hash, word1), temp, pointer, pos, word1, 0, 0);
+                    this.map.putAndCollect(segment, completeHash(hash, word1), temp, pointer, pos, word1, 0, 0);
 
                     pointer += pos + (decimalPos >>> 3) + 4;
                 }
                 else {
-                    long word2 = getWord(pointer + 8);
+                    long word2 = getWord(segment, pointer + 8);
                     if ((s = hasSemicolon(word2)) != 0) {
                         pos = semicolonPos(s);
                         // read temparature
                         final int length = pos + 8;
-                        final long numberWord = getWord(pointer + length + 1);
+                        final long numberWord = getWord(segment, pointer + length + 1);
                         final int decimalPos = decimalPos(numberWord);
                         final int temp = convertIntoNumber(decimalPos, numberWord);
 
                         word2 = partial(word2, pos); // last word
-                        this.map.putAndCollect(completeHash(hash, word1, word2), temp, pointer, length, word1, word2, 0);
+                        this.map.putAndCollect(segment, completeHash(hash, word1, word2), temp, pointer, length, word1, word2, 0);
 
                         pointer += length + (decimalPos >>> 3) + 4; // seek to the line end
                     }
@@ -342,7 +334,7 @@ public class CalculateAverage_yavuztas {
                         // Then it's automatically unrolled
                         // Max key length is 13 longs, 2 we've read before, 11 left
                         for (int i = 0; i < MAX_INNER_LOOP_SIZE; i++) {
-                            if ((s = hasSemicolon((word = getWord(pointer + length)))) != 0) {
+                            if ((s = hasSemicolon((word = getWord(segment, pointer + length)))) != 0) {
                                 break;
                             }
                             hash = appendHash(hash, word);
@@ -352,12 +344,12 @@ public class CalculateAverage_yavuztas {
                         pos = semicolonPos(s);
                         length += pos;
                         // read temparature
-                        final long numberWord = getWord(pointer + length + 1);
+                        final long numberWord = getWord(segment, pointer + length + 1);
                         final int decimalPos = decimalPos(numberWord);
                         final int temp = convertIntoNumber(decimalPos, numberWord);
 
                         word = partial(word, pos); // last word
-                        this.map.putAndCollect(completeHash(hash, word), temp, pointer, length, word1, word2, word);
+                        this.map.putAndCollect(segment, completeHash(hash, word), temp, pointer, length, word1, word2, word);
 
                         pointer += length + (decimalPos >>> 3) + 4; // seek to the line end
                     }
@@ -424,15 +416,14 @@ public class CalculateAverage_yavuztas {
     }
 
     /**
-     * Scans the given buffer to the left
+     * Scans backwards from nominalEnd to the closest position that is right after a line break
      */
-    private static long findClosestLineEnd(long start, int size) {
-        long position = start + size;
-        while (UNSAFE.getByte(--position) != '\n') {
-            // read until a linebreak
-            size--;
+    private static long findClosestLineEnd(MemorySegment file, long from, long nominalEnd) {
+        long end = nominalEnd;
+        while (end > from && file.get(ValueLayout.JAVA_BYTE, end - 1) != '\n') {
+            end--;
         }
-        return size;
+        return end;
     }
 
     private static boolean isWorkerProcess(String[] args) {
@@ -448,6 +439,7 @@ public class CalculateAverage_yavuztas {
 
         new ProcessBuilder()
                 .command(commands)
+                .redirectError(ProcessBuilder.Redirect.INHERIT) // don't let an undrained stderr pipe block the worker
                 .start()
                 .getInputStream()
                 .transferTo(System.out);
@@ -462,36 +454,50 @@ public class CalculateAverage_yavuztas {
             return;
         }
 
-        var concurrency = 2 * Runtime.getRuntime().availableProcessors();
         final long fileSize = Files.size(FILE);
-        long regionSize = fileSize / concurrency;
-
-        // handling extreme cases
-        while (regionSize > Integer.MAX_VALUE) {
-            concurrency *= 2;
-            regionSize /= 2;
+        final MemorySegment file;
+        try (FileChannel channel = FileChannel.open(FILE, StandardOpenOption.READ)) {
+            // the mapping lives in the global arena, so it stays valid after the channel is closed
+            file = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
         }
-        if (fileSize <= 1 << 20) { // small file (1mb), no need concurrency
+
+        // Split the file in two parts: a bulk part that is processed straight from the mapping, and a
+        // short tail (a few lines) that is copied into a zero-padded buffer, because word loads on the
+        // last lines would otherwise run past the end of the segment.
+        long tailStart = Math.max(0, fileSize - TAIL_MARGIN);
+        while (tailStart > 0 && file.get(ValueLayout.JAVA_BYTE, tailStart - 1) != '\n') {
+            tailStart--; // move back to a line start
+        }
+        final long mainSize = tailStart;
+
+        int concurrency = 2 * Runtime.getRuntime().availableProcessors();
+        if (mainSize <= 1 << 20) { // small input (1mb), no need concurrency
             concurrency = 1;
-            regionSize = fileSize;
         }
+        final long regionSize = mainSize / concurrency;
 
+        final List<RegionActor> actors = new ArrayList<>(concurrency + 1);
         long startPos = 0;
-        final FileChannel channel = (FileChannel) Files.newByteChannel(FILE, StandardOpenOption.READ);
-        // get the memory address, this is the only thing we need for Unsafe
-        final long memoryAddress = channel.map(FileChannel.MapMode.READ_ONLY, startPos, fileSize, Arena.global()).address();
+        for (int i = 0; i < concurrency && startPos < mainSize; i++) {
+            // the last region always runs up to the end of the bulk part, so no lines are left behind
+            final long endPos = (i == concurrency - 1)
+                    ? mainSize
+                    : findClosestLineEnd(file, startPos, startPos + regionSize);
 
-        final RegionActor[] actors = new RegionActor[concurrency];
-        for (int i = 0; i < concurrency; i++) {
-            // calculate boundaries
-            long maxSize = (startPos + regionSize > fileSize) ? fileSize - startPos : regionSize;
-            // shift position to back until we find a linebreak
-            maxSize = findClosestLineEnd(memoryAddress + startPos, (int) maxSize);
-
-            final RegionActor region = (actors[i] = new RegionActor(memoryAddress + startPos, (int) maxSize));
+            final RegionActor region = new RegionActor(file, startPos, endPos);
+            actors.add(region);
             region.start(); // start processing
 
-            startPos += maxSize;
+            startPos = endPos;
+        }
+
+        if (tailStart < fileSize) {
+            final long tailLength = fileSize - tailStart;
+            final MemorySegment tail = Arena.global().allocate(tailLength + TAIL_MARGIN); // zero-filled padding
+            MemorySegment.copy(file, tailStart, tail, 0, tailLength);
+            final RegionActor tailRegion = new RegionActor(tail, 0, tailLength);
+            actors.add(tailRegion);
+            tailRegion.start();
         }
 
         final RecordMap output = new RecordMap(); // output to merge all records

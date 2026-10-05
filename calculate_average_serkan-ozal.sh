@@ -15,17 +15,11 @@
 #  limitations under the License.
 #
 
-JAVA_OPTS="--enable-preview --enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector "
+JAVA_OPTS="--enable-preview --enable-native-access=ALL-UNNAMED --add-modules=jdk.incubator.vector"
 JAVA_OPTS="$JAVA_OPTS -XX:+UnlockExperimentalVMOptions -XX:+UnlockDiagnosticVMOptions"
 JAVA_OPTS="$JAVA_OPTS -XX:-TieredCompilation -XX:MaxInlineSize=10000 -XX:InlineSmallCode=10000 -XX:FreqInlineSize=10000"
 JAVA_OPTS="$JAVA_OPTS -XX:-UseCountedLoopSafepoints -XX:LoopStripMiningIter=0 -XX:GuaranteedSafepointInterval=0"
 JAVA_OPTS="$JAVA_OPTS -XX:+TrustFinalNonStaticFields -da -dsa -XX:+UseNUMA"
-JAVA_OPTS="$JAVA_OPTS -XX:SharedArchiveFile=target/CalculateAverage_serkan_ozal_cds.jsa"
 JAVA_OPTS="$JAVA_OPTS -Djdk.incubator.vector.VECTOR_ACCESS_OOB_CHECK=0"
 
-
-#echo "Process started at $(date +%s%N | cut -b1-13)"
-eval "exec 3< <({ java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_serkan_ozal; })"
-read <&3 result
-echo -e "$result"
-#echo "Process finished at $(date +%s%N | cut -b1-13)"
+java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_serkan_ozal

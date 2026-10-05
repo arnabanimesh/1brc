@@ -15,15 +15,16 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.TreeMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -32,34 +33,19 @@ import java.util.concurrent.Future;
 public class CalculateAverage_ags313 {
 
     private static final int THREAD_COUNT = 8;
-    private static final int FUTURE_BUFFER = 1024;
     private static final int ALLOCATION = 128 * 1024 * 1024;
 
-    // private static final String FILE = "./measurementsCut.txt";
     private static final String FILE = "./measurements.txt";
-    // private static final String FILE = "./src/test/resources/samples/measurements-1.txt";
-    // private static final String FILE = "./src/test/resources/samples/measurements-20.txt";
 
     private static final int NAME_LENGTH_LIMIT_BYTES = 128;
     private static final int BUFFER_SIZE = 108;
     private static final ExecutorService exec = Executors.newFixedThreadPool(THREAD_COUNT);
-
-    /**
-     *  1B rows
-     *  8s  multithreaded
-     *  44s single threaded
-     *
-     *  ideas:
-     *  1) replace hashmap with something faster(er)
-     *  2) play with graal
-     **/
 
     private static class Key implements Comparable<Key> {
         private final byte[] value = new byte[NAME_LENGTH_LIMIT_BYTES];
         private int hashCode;
         private int length = 0;
 
-        // https://stackoverflow.com/questions/20952739/how-would-you-convert-a-string-to-a-64-bit-integer
         public void accept(byte b) {
             value[length] = b;
             length += 1;
@@ -77,13 +63,8 @@ public class CalculateAverage_ags313 {
                 return false;
             if (length != key.length)
                 return false;
-            for (int i = 0; i < length; i++) {
-                if (UNSAFE.getByte(value, i) != UNSAFE.getByte(key.value, i)) {
-                    return false;
-                }
-            }
-
-            return true;
+            // Replaces the sun.misc.Unsafe byte-by-byte loop (Unsafe memory access is removed/denied in recent JDKs).
+            return Arrays.equals(value, 0, length, key.value, 0, length);
         }
 
         @Override
@@ -93,7 +74,7 @@ public class CalculateAverage_ags313 {
 
         @Override
         public String toString() {
-            return new String(value, 0, length);
+            return new String(value, 0, length, StandardCharsets.UTF_8);
         }
 
         void reset() {
@@ -165,25 +146,20 @@ public class CalculateAverage_ags313 {
         var channel = new RandomAccessFile(FILE, "r").getChannel();
         long totalToRead = channel.size();
 
-        Future<HashMap<Key, Stats>>[] futures = new Future[FUTURE_BUFFER];
+        List<Future<HashMap<Key, Stats>>> futures = new ArrayList<>();
 
         long allocated = 0;
-        int chunkCounter = 0;
         while (allocated < totalToRead) {
             var start = allocated;
             var bytesToReadInPass = Math.min(totalToRead - allocated, ALLOCATION);
 
             if (bytesToReadInPass < BUFFER_SIZE) {
-                // System.out.println("Want to read: " + bytesToReadInPass + ", starting buffer at: " + startBufferAt);
-                // System.out.println("Total: " + totalToRead + ", allocated: " + allocated + ", allocating: " + (correctedBytesToRead));
-                futures[chunkCounter++] = exec.submit(() -> readChunk(channel, start, (int) bytesToReadInPass));
+                futures.add(exec.submit(() -> readChunk(channel, start, (int) bytesToReadInPass)));
                 allocated += bytesToReadInPass;
             }
             else {
                 var startBufferAt = Math.max(0, allocated + bytesToReadInPass - BUFFER_SIZE);
                 var buffer = channel.map(FileChannel.MapMode.READ_ONLY, startBufferAt, BUFFER_SIZE);
-
-                // System.out.println("Want to read: " + bytesToReadInPass + ", starting buffer at: " + startBufferAt);
 
                 var endOfLine = 0;
                 for (int i = 0; i < BUFFER_SIZE; i++) {
@@ -194,21 +170,19 @@ public class CalculateAverage_ags313 {
                 }
                 long correctedBytesToRead = bytesToReadInPass - BUFFER_SIZE + endOfLine;
 
-                // System.out.println("Total: " + totalToRead + ", allocated: " + allocated + ", allocating: " + (correctedBytesToRead));
-                futures[chunkCounter++] = exec.submit(() -> readChunk(channel, start, (int) correctedBytesToRead));
+                futures.add(exec.submit(() -> readChunk(channel, start, (int) correctedBytesToRead)));
                 allocated += correctedBytesToRead + 1;
             }
         }
 
         var accumulator = new HashMap<Key, Stats>(1024 * 16);
-        for (int i = 0; i < chunkCounter; i++) {
-            var aMap = futures[i].get();
-            aMap.forEach((key, value) -> accumulator.computeIfAbsent(key, __ -> new Stats()).merge(value));
+        for (var future : futures) {
+            future.get().forEach((key, value) -> accumulator.computeIfAbsent(key, __ -> new Stats()).merge(value));
         }
 
         exec.shutdown();
 
-        System.out.println(new TreeMap(accumulator));
+        System.out.println(new TreeMap<>(accumulator));
     }
 
     static class Stats {
@@ -232,19 +206,6 @@ public class CalculateAverage_ags313 {
             min = Math.min(this.min, that.min);
             total += that.total;
             count += that.count;
-        }
-    }
-
-    private static final Unsafe UNSAFE = unsafe();
-
-    private static Unsafe unsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
         }
     }
 }

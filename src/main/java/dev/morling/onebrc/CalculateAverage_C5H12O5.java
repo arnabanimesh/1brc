@@ -15,11 +15,10 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.lang.reflect.Field;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.AsynchronousFileChannel;
@@ -63,6 +62,9 @@ public class CalculateAverage_C5H12O5 {
     private static final int TRANSFER_QUEUE_CAPACITY = 1024 / 16 / AVAILABLE_PROCESSOR_NUM; // 1GB memory max
     private static final int BYTE_BUFFER_CAPACITY = 1024 * 1024 * 16; // 16MB one time
     private static final int EXPECTED_MAPPINGS_NUM = 10000;
+    // Leading padding of every chunk array. The backwards scan reads 8 bytes ending at the current
+    // position, and a checked VarHandle read must stay inside the array even for the first line.
+    private static final int PADDING = Long.BYTES - 1;
 
     /**
      * Fragment the file into chunks.
@@ -153,10 +155,10 @@ public class CalculateAverage_C5H12O5 {
                         }
                     }
                     buffer.flip();
-                    byte[] bytes = new byte[buffer.limit() + 1];
-                    // add a newline byte at the beginning
-                    bytes[0] = '\n';
-                    buffer.get(bytes, 1, buffer.limit());
+                    byte[] bytes = new byte[PADDING + 1 + buffer.limit()];
+                    // add a newline byte right after the padding
+                    bytes[PADDING] = '\n';
+                    buffer.get(bytes, PADDING + 1, buffer.limit());
                     transfer(bytes);
                     if ((position += buffer.limit()) < limit) {
                         buffer.clear();
@@ -200,8 +202,8 @@ public class CalculateAverage_C5H12O5 {
             Map<Station, MeasurementData> result = HashMap.newHashMap(EXPECTED_MAPPINGS_NUM);
             for (byte[] bytes = transfer.take(); bytes.length > 0; bytes = transfer.take()) {
                 Station station = new Station(bytes);
-                // read the bytes backwards
-                for (int position = bytes.length - 2; position >= 1; position--) {
+                // read the bytes backwards, stopping at the newline right after the padding
+                for (int position = bytes.length - 2; position > PADDING; position--) {
 
                     // calculate the temperature value
                     int temperature = bytes[position] - '0' + (bytes[position -= 2] - '0') * 10;
@@ -246,7 +248,8 @@ public class CalculateAverage_C5H12O5 {
                     MeasurementData data = result.get(station.slice(hash, position + 1, semicolon));
                     if (data == null) {
                         result.put(station.copy(), new MeasurementData(temperature));
-                    } else {
+                    }
+                    else {
                         data.merge(temperature);
                     }
                 }
@@ -262,23 +265,14 @@ public class CalculateAverage_C5H12O5 {
         // choose the implementation according to the native byte order
         LineFinder NATIVE = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN ? LELineFinder.INST : BELineFinder.INST;
 
-        Unsafe UNSAFE = initUnsafe();
-        int BYTE_ARRAY_BASE_OFFSET = UNSAFE.arrayBaseOffset(byte[].class);
-        int LONG_BYTES = Long.SIZE / Byte.SIZE;
+        // plain (possibly unaligned) 8-byte view over a byte[] in the native byte order
+        VarHandle LONG_VIEW = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder());
 
-        static Unsafe initUnsafe() {
-            try {
-                Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-                theUnsafe.setAccessible(true);
-                return (Unsafe) theUnsafe.get(Unsafe.class);
-            }
-            catch (NoSuchFieldException | IllegalAccessException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
-        static long previousLong(byte[] bytes, long offset) {
-            return UNSAFE.getLong(bytes, BYTE_ARRAY_BASE_OFFSET + offset + 1 - LONG_BYTES);
+        /**
+         * Read the 8 bytes ending at (and including) {@code offset}.
+         */
+        static long previousLong(byte[] bytes, int offset) {
+            return (long) LONG_VIEW.get(bytes, offset + 1 - Long.BYTES);
         }
 
         /**
@@ -422,7 +416,7 @@ public class CalculateAverage_C5H12O5 {
 
         @Override
         public String toString() {
-            return "%s/{Math.round((double) sum / count) / 10.0}/{max / 10.0}".formatted(min / 10.0);
+            return (min / 10.0) + "/" + (Math.round((double) sum / count) / 10.0) + "/" + (max / 10.0);
         }
     }
 }

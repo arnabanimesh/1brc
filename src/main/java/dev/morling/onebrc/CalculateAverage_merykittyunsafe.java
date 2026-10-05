@@ -18,12 +18,13 @@ package dev.morling.onebrc;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
-import sun.misc.Unsafe;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
@@ -33,19 +34,29 @@ import java.nio.file.StandardOpenOption;
 import java.util.Map;
 import java.util.TreeMap;
 
+/**
+ * JDK 27 compatible version of the original "merykittyunsafe" solution.
+ *
+ * The memory-access methods of sun.misc.Unsafe throw UnsupportedOperationException by default
+ * since JDK 26 (JEP 471 / JEP 498), so this version no longer uses Unsafe at all:
+ *
+ *  - the memory-mapped input file is read through the (final since JDK 22) FFM API, using
+ *    offsets into the mapped MemorySegment instead of raw addresses;
+ *  - the per-thread hash table (a plain byte[]) is accessed through byte-array-view VarHandles;
+ *  - MemorySegment.reinterpret (a restricted method) is no longer needed.
+ *
+ * Build and run (the Vector API is still an incubator module in JDK 27):
+ *
+ *   javac --add-modules jdk.incubator.vector -d out CalculateAverage_merykittyunsafe.java
+ *   java  --add-modules jdk.incubator.vector -cp out dev.morling.onebrc.CalculateAverage_merykittyunsafe
+ */
 public class CalculateAverage_merykittyunsafe {
     private static final String FILE = "./measurements.txt";
-    private static final Unsafe UNSAFE;
-    static {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            UNSAFE = (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
+
+    private static final ByteOrder NATIVE_ORDER = ByteOrder.nativeOrder();
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfInt INT_UNALIGNED = ValueLayout.JAVA_INT_UNALIGNED;
+    private static final ValueLayout.OfLong LONG_UNALIGNED = ValueLayout.JAVA_LONG_UNALIGNED;
 
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_PREFERRED.length() >= 32
             ? ByteVector.SPECIES_256
@@ -83,83 +94,88 @@ public class CalculateAverage_merykittyunsafe {
         private static final int CAPACITY = 1 << 17;
         private static final int ENTRY_MASK = ENTRY_SIZE * CAPACITY - 1;
 
+        // Views over the backing byte[] (replaces sun.misc.Unsafe get/put on the array).
+        // All offsets used below are naturally aligned, and plain get/set also allow unaligned access.
+        private static final VarHandle SHORT_VIEW = MethodHandles.byteArrayViewVarHandle(short[].class, NATIVE_ORDER);
+        private static final VarHandle INT_VIEW = MethodHandles.byteArrayViewVarHandle(int[].class, NATIVE_ORDER);
+        private static final VarHandle LONG_VIEW = MethodHandles.byteArrayViewVarHandle(long[].class, NATIVE_ORDER);
+
         final byte[] data;
 
         PoorManMap() {
             this.data = new byte[CAPACITY * ENTRY_SIZE];
         }
 
-        void observe(long entryOffset, long value) {
-            long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-            if (UNSAFE.getShort(this.data, baseOffset + MIN_OFFSET) > value) {
-                UNSAFE.putShort(this.data, baseOffset + MIN_OFFSET, (short) value);
-            }
-            if (UNSAFE.getShort(this.data, baseOffset + MAX_OFFSET) < value) {
-                UNSAFE.putShort(this.data, baseOffset + MAX_OFFSET, (short) value);
-            }
-            UNSAFE.putLong(this.data, baseOffset + SUM_OFFSET,
-                    value + UNSAFE.getLong(this.data, baseOffset + SUM_OFFSET));
-            UNSAFE.putLong(this.data, baseOffset + COUNT_OFFSET,
-                    1 + UNSAFE.getLong(this.data, baseOffset + COUNT_OFFSET));
+        int sizeAt(int entryOffset) {
+            return (int) INT_VIEW.get(this.data, entryOffset + SIZE_OFFSET);
         }
 
-        long indexSimple(long address, int size) {
+        void observe(int entryOffset, long value) {
+            final byte[] data = this.data;
+            if ((short) SHORT_VIEW.get(data, entryOffset + MIN_OFFSET) > value) {
+                SHORT_VIEW.set(data, entryOffset + MIN_OFFSET, (short) value);
+            }
+            if ((short) SHORT_VIEW.get(data, entryOffset + MAX_OFFSET) < value) {
+                SHORT_VIEW.set(data, entryOffset + MAX_OFFSET, (short) value);
+            }
+            LONG_VIEW.set(data, entryOffset + SUM_OFFSET,
+                    value + (long) LONG_VIEW.get(data, entryOffset + SUM_OFFSET));
+            LONG_VIEW.set(data, entryOffset + COUNT_OFFSET,
+                    1L + (long) LONG_VIEW.get(data, entryOffset + COUNT_OFFSET));
+        }
+
+        int indexSimple(MemorySegment input, long pos, int size) {
             int x;
             int y;
             if (size >= Integer.BYTES) {
-                x = UNSAFE.getInt(address);
-                y = UNSAFE.getInt(address + size - Integer.BYTES);
+                x = input.get(INT_UNALIGNED, pos);
+                y = input.get(INT_UNALIGNED, pos + size - Integer.BYTES);
             }
             else {
-                x = UNSAFE.getByte(address);
-                y = UNSAFE.getByte(address + size - Byte.BYTES);
+                x = input.get(BYTE, pos);
+                y = input.get(BYTE, pos + size - Byte.BYTES);
             }
             int hash = hash(x, y);
-            long entryOffset = (hash * ENTRY_SIZE) & ENTRY_MASK;
+            int entryOffset = (hash * ENTRY_SIZE) & ENTRY_MASK;
             for (;; entryOffset = (entryOffset + ENTRY_SIZE) & ENTRY_MASK) {
-                int nodeSize = UNSAFE.getInt(this.data, Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset + SIZE_OFFSET);
+                int nodeSize = sizeAt(entryOffset);
                 if (nodeSize == 0) {
-                    insertInto(entryOffset, address, size);
+                    insertInto(entryOffset, input, pos, size);
                     return entryOffset;
                 }
-                else if (keyEqualScalar(entryOffset, address, size)) {
+                else if (keyEqualScalar(entryOffset, input, pos, size)) {
                     return entryOffset;
                 }
             }
         }
 
-        void insertInto(long entryOffset, long address, int size) {
-            long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-            UNSAFE.putInt(this.data, baseOffset + SIZE_OFFSET, size);
-            UNSAFE.putShort(this.data, baseOffset + MIN_OFFSET, Short.MAX_VALUE);
-            UNSAFE.putShort(this.data, baseOffset + MAX_OFFSET, Short.MIN_VALUE);
-            try (var arena = Arena.ofConfined()) {
-                var segment = MemorySegment.ofAddress(address)
-                        .reinterpret(size + 1, arena, null);
-                MemorySegment.copy(segment, 0, MemorySegment.ofArray(this.data), entryOffset + KEY_OFFSET, size + 1);
-            }
+        void insertInto(int entryOffset, MemorySegment input, long pos, int size) {
+            INT_VIEW.set(this.data, entryOffset + SIZE_OFFSET, size);
+            SHORT_VIEW.set(this.data, entryOffset + MIN_OFFSET, Short.MAX_VALUE);
+            SHORT_VIEW.set(this.data, entryOffset + MAX_OFFSET, Short.MIN_VALUE);
+            // Copy the key together with its trailing ';' so that the vector comparison
+            // in iterate() can cover the delimiter as well.
+            MemorySegment.copy(input, BYTE, pos, this.data, entryOffset + KEY_OFFSET, size + 1);
         }
 
         void mergeInto(Map<String, Aggregator> target) {
             for (int entryOffset = 0; entryOffset < data.length; entryOffset += ENTRY_SIZE) {
-                long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-                int size = UNSAFE.getInt(this.data, baseOffset + SIZE_OFFSET);
+                int size = sizeAt(entryOffset);
                 if (size == 0) {
                     continue;
                 }
 
                 String key = new String(this.data, entryOffset + KEY_OFFSET, size, StandardCharsets.UTF_8);
-                target.compute(key, (k, v) -> {
-                    if (v == null) {
-                        v = new Aggregator();
-                    }
+                long min = (short) SHORT_VIEW.get(this.data, entryOffset + MIN_OFFSET);
+                long max = (short) SHORT_VIEW.get(this.data, entryOffset + MAX_OFFSET);
+                long sum = (long) LONG_VIEW.get(this.data, entryOffset + SUM_OFFSET);
+                long count = (long) LONG_VIEW.get(this.data, entryOffset + COUNT_OFFSET);
 
-                    v.min = Math.min(v.min, UNSAFE.getShort(this.data, baseOffset + MIN_OFFSET));
-                    v.max = Math.max(v.max, UNSAFE.getShort(this.data, baseOffset + MAX_OFFSET));
-                    v.sum += UNSAFE.getLong(this.data, baseOffset + SUM_OFFSET);
-                    v.count += UNSAFE.getLong(this.data, baseOffset + COUNT_OFFSET);
-                    return v;
-                });
+                Aggregator v = target.computeIfAbsent(key, k -> new Aggregator());
+                v.min = Math.min(v.min, min);
+                v.max = Math.max(v.max, max);
+                v.sum += sum;
+                v.count += count;
             }
         }
 
@@ -169,17 +185,14 @@ public class CalculateAverage_merykittyunsafe {
             return (Integer.rotateLeft(x * seed, rotate) ^ y) * seed; // FxHash
         }
 
-        private boolean keyEqualScalar(long entryOffset, long address, int size) {
-            long baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryOffset;
-            if (UNSAFE.getInt(this.data, baseOffset + SIZE_OFFSET) != size) {
+        private boolean keyEqualScalar(int entryOffset, MemorySegment input, long pos, int size) {
+            if (sizeAt(entryOffset) != size) {
                 return false;
             }
 
             // Be simple
-            for (long i = 0; i < size; i++) {
-                int c1 = UNSAFE.getByte(this.data, baseOffset + KEY_OFFSET + i);
-                int c2 = UNSAFE.getByte(address + i);
-                if (c1 != c2) {
+            for (int i = 0; i < size; i++) {
+                if (this.data[entryOffset + KEY_OFFSET + i] != input.get(BYTE, pos + i)) {
                     return false;
                 }
             }
@@ -191,9 +204,9 @@ public class CalculateAverage_merykittyunsafe {
     // 1 - 2 digits to the left and 1 digits to the right of the separator to a
     // fix-precision format. It returns the offset of the next line (presumably followed
     // the final digit and a '\n')
-    private static long parseDataPoint(PoorManMap aggrMap, long entryOffset, long address) {
-        long word = UNSAFE.getLong(address);
-        if (ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN) {
+    private static long parseDataPoint(PoorManMap aggrMap, MemorySegment input, int entryOffset, long pos) {
+        long word = input.get(LONG_UNALIGNED, pos);
+        if (NATIVE_ORDER == ByteOrder.BIG_ENDIAN) {
             word = Long.reverseBytes(word);
         }
         // The 4th binary digit of the ascii of a digit is 1 while
@@ -219,23 +232,23 @@ public class CalculateAverage_merykittyunsafe {
         long absValue = ((digits * 0x640a0001) >>> 32) & 0x3FF;
         long value = (absValue ^ signed) - signed;
         aggrMap.observe(entryOffset, value);
-        return address + (decimalSepPos >>> 3) + 3;
+        return pos + (decimalSepPos >>> 3) + 3;
     }
 
     // Tail processing version of the above, do not over-fetch and be simple
-    private static long parseDataPointSimple(PoorManMap aggrMap, long entryOffset, long address) {
+    private static long parseDataPointSimple(PoorManMap aggrMap, MemorySegment input, int entryOffset, long pos) {
         int value = 0;
         boolean negative = false;
-        if (UNSAFE.getByte(address) == '-') {
+        if (input.get(BYTE, pos) == '-') {
             negative = true;
-            address++;
+            pos++;
         }
-        for (;; address++) {
-            int c = UNSAFE.getByte(address);
+        for (;; pos++) {
+            int c = input.get(BYTE, pos);
             if (c == '.') {
-                c = UNSAFE.getByte(address + 1);
+                c = input.get(BYTE, pos + 1);
                 value = value * 10 + (c - '0');
-                address += 3;
+                pos += 3;
                 break;
             }
 
@@ -243,33 +256,28 @@ public class CalculateAverage_merykittyunsafe {
         }
         value = negative ? -value : value;
         aggrMap.observe(entryOffset, value);
-        return address;
+        return pos;
     }
 
-    // An iteration of the main parse loop, parse a line starting from offset.
-    // This requires offset to be the start of the line and there is spare space so
+    // An iteration of the main parse loop, parse a line starting from pos.
+    // This requires pos to be the start of the line and there is spare space so
     // that we have relative freedom in processing
     // It returns the offset of the next line that it needs processing
-    private static long iterate(PoorManMap aggrMap, long address) {
-        ByteVector line;
-        try (var arena = Arena.ofConfined()) {
-            var segment = MemorySegment.ofAddress(address)
-                    .reinterpret(BYTE_SPECIES.vectorByteSize(), arena, null);
-            line = ByteVector.fromMemorySegment(BYTE_SPECIES, segment, 0, ByteOrder.nativeOrder());
-        }
+    private static long iterate(PoorManMap aggrMap, MemorySegment input, long pos) {
+        ByteVector line = ByteVector.fromMemorySegment(BYTE_SPECIES, input, pos, NATIVE_ORDER);
 
         // Find the delimiter ';'
-        long semicolons = line.compare(VectorOperators.EQ, ';').toLong();
+        long semicolons = line.compare(VectorOperators.EQ, (byte) ';').toLong();
 
         // If we cannot find the delimiter in the vector, that means the key is
         // longer than the vector, fall back to scalar processing
         if (semicolons == 0) {
             int keySize = BYTE_SPECIES.length();
-            while (UNSAFE.getByte(address + keySize) != ';') {
+            while (input.get(BYTE, pos + keySize) != ';') {
                 keySize++;
             }
-            var node = aggrMap.indexSimple(address, keySize);
-            return parseDataPoint(aggrMap, node, address + 1 + keySize);
+            int node = aggrMap.indexSimple(input, pos, keySize);
+            return parseDataPoint(aggrMap, input, node, pos + 1 + keySize);
         }
 
         // We inline the searching of the value in the hash map
@@ -277,20 +285,19 @@ public class CalculateAverage_merykittyunsafe {
         int x;
         int y;
         if (keySize >= Integer.BYTES) {
-            x = UNSAFE.getInt(address);
-            y = UNSAFE.getInt(address + keySize - Integer.BYTES);
+            x = input.get(INT_UNALIGNED, pos);
+            y = input.get(INT_UNALIGNED, pos + keySize - Integer.BYTES);
         }
         else {
-            x = UNSAFE.getByte(address);
-            y = UNSAFE.getByte(address + keySize - Byte.BYTES);
+            x = input.get(BYTE, pos);
+            y = input.get(BYTE, pos + keySize - Byte.BYTES);
         }
         int hash = PoorManMap.hash(x, y);
-        long entryOffset = (hash * PoorManMap.ENTRY_SIZE) & PoorManMap.ENTRY_MASK;
+        int entryOffset = (hash * PoorManMap.ENTRY_SIZE) & PoorManMap.ENTRY_MASK;
         for (;; entryOffset = (entryOffset + PoorManMap.ENTRY_SIZE) & PoorManMap.ENTRY_MASK) {
-            var nodeSize = UNSAFE.getInt(aggrMap.data, Unsafe.ARRAY_BYTE_BASE_OFFSET
-                    + entryOffset + PoorManMap.SIZE_OFFSET);
+            int nodeSize = aggrMap.sizeAt(entryOffset);
             if (nodeSize == 0) {
-                aggrMap.insertInto(entryOffset, address, keySize);
+                aggrMap.insertInto(entryOffset, input, pos, keySize);
                 break;
             }
 
@@ -298,7 +305,7 @@ public class CalculateAverage_merykittyunsafe {
                 continue;
             }
 
-            var nodeKey = ByteVector.fromArray(BYTE_SPECIES, aggrMap.data, (int) (entryOffset + PoorManMap.KEY_OFFSET));
+            var nodeKey = ByteVector.fromArray(BYTE_SPECIES, aggrMap.data, entryOffset + PoorManMap.KEY_OFFSET);
             long eqMask = line.compare(VectorOperators.EQ, nodeKey).toLong();
             long validMask = semicolons ^ (semicolons - 1);
             if ((eqMask & validMask) == validMask) {
@@ -306,17 +313,17 @@ public class CalculateAverage_merykittyunsafe {
             }
         }
 
-        return parseDataPoint(aggrMap, entryOffset, address + keySize + 1);
+        return parseDataPoint(aggrMap, input, entryOffset, pos + keySize + 1);
     }
 
-    private static long findOffset(long base, long offset, long limit) {
+    private static long findOffset(MemorySegment input, long offset, long limit) {
         if (offset == 0) {
             return offset;
         }
 
         offset--;
         while (offset < limit) {
-            if (UNSAFE.getByte(base + (offset++)) == '\n') {
+            if (input.get(BYTE, offset++) == '\n') {
                 break;
             }
         }
@@ -324,12 +331,11 @@ public class CalculateAverage_merykittyunsafe {
     }
 
     // Process all lines that start in [offset, limit)
-    private static PoorManMap processFile(MemorySegment data, long offset, long limit) {
+    private static PoorManMap processFile(MemorySegment input, long offset, long limit) {
         var aggrMap = new PoorManMap();
         if (offset == limit) {
             return aggrMap;
         }
-        long base = data.address();
         int batches = 2;
         long batchSize = Math.ceilDiv(limit - offset, batches);
         long offset0 = offset;
@@ -338,33 +344,33 @@ public class CalculateAverage_merykittyunsafe {
         long limit1 = limit;
 
         // Find the start of a new line
-        offset0 = findOffset(base, offset0, limit0);
-        offset1 = findOffset(base, offset1, limit1);
+        offset0 = findOffset(input, offset0, limit0);
+        offset1 = findOffset(input, offset1, limit1);
 
         long begin;
-        long end = base + limit;
+        long end = limit;
         long mainLoopMinWidth = Math.max(BYTE_SPECIES.vectorByteSize(), KEY_MAX_SIZE + 1 + Long.BYTES);
         if (limit1 - offset1 < mainLoopMinWidth) {
-            begin = base + findOffset(base, offset, limit);
+            begin = findOffset(input, offset, limit);
             while (begin < end - mainLoopMinWidth) {
-                begin = iterate(aggrMap, begin);
+                begin = iterate(aggrMap, input, begin);
             }
         }
         else {
-            long begin0 = base + offset0;
-            long begin1 = base + offset1;
-            long end0 = base + limit0;
-            long end1 = base + limit1;
+            long begin0 = offset0;
+            long begin1 = offset1;
+            long end0 = limit0;
+            long end1 = limit1;
             while (true) {
                 boolean finish = false;
                 if (begin0 < end0) {
-                    begin0 = iterate(aggrMap, begin0);
+                    begin0 = iterate(aggrMap, input, begin0);
                 }
                 else {
                     finish = true;
                 }
                 if (begin1 < end1 - mainLoopMinWidth) {
-                    begin1 = iterate(aggrMap, begin1);
+                    begin1 = iterate(aggrMap, input, begin1);
                 }
                 else {
                     if (finish) {
@@ -378,11 +384,11 @@ public class CalculateAverage_merykittyunsafe {
         // Now we are at the tail, just be simple
         while (begin < end) {
             int keySize = 0;
-            while (UNSAFE.getByte(begin + keySize) != ';') {
+            while (input.get(BYTE, begin + keySize) != ';') {
                 keySize++;
             }
-            long entryOffset = aggrMap.indexSimple(begin, keySize);
-            begin = parseDataPointSimple(aggrMap, entryOffset, begin + 1 + keySize);
+            int entryOffset = aggrMap.indexSimple(input, begin, keySize);
+            begin = parseDataPointSimple(aggrMap, input, entryOffset, begin + 1 + keySize);
         }
 
         return aggrMap;

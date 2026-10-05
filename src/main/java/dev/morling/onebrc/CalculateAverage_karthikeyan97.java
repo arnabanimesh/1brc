@@ -15,53 +15,23 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
-import static java.util.stream.Collectors.*;
-
-import java.io.FileInputStream;
+import static java.util.stream.Collectors.groupingBy;
 
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
-import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
 import java.util.Map;
-import java.util.Scanner;
-import java.util.Set;
 import java.util.TreeMap;
-import java.util.function.BiConsumer;
-import java.util.function.BinaryOperator;
-import java.util.function.Function;
-import java.util.function.Supplier;
 import java.util.stream.Collector;
-import java.util.stream.Collectors;
 
 public class CalculateAverage_karthikeyan97 {
 
-    private static final Unsafe UNSAFE = initUnsafe();
-
     private static final String FILE = "./measurements.txt";
-
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
 
     private record Measurement(modifiedbytearray station, double value) {
     }
@@ -90,8 +60,6 @@ public class CalculateAverage_karthikeyan97 {
     }
 
     public static void main(String[] args) throws Exception {
-        // long start = System.nanoTime();
-        // System.setSecurityManager(null);
         Collector<Map.Entry<modifiedbytearray, MeasurementAggregator>, MeasurementAggregator, MeasurementAggregator> collector = Collector.of(
                 MeasurementAggregator::new,
                 (a, m) -> {
@@ -120,38 +88,46 @@ public class CalculateAverage_karthikeyan97 {
                 },
                 agg -> agg);
 
-        RandomAccessFile raf = new RandomAccessFile(FILE, "r");
-        FileChannel fileChannel = raf.getChannel();
-        final long mappedAddress = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, raf.length(), Arena.global()).address();
-        long length = raf.length();
-        final long endAddress = mappedAddress + length - 1;
-        int cores = length > 1000 ? Runtime.getRuntime().availableProcessors() : 1;
-        long boundary[][] = new long[cores][2];
-        long segments = length / (cores);
+        final MemorySegment mapped;
+        long boundary[][];
+        int cores;
+        long length;
         long before = -1;
-        for (int i = 0; i < cores - 1; i++) {
-            boundary[i][0] = before + 1;
-            if (before + segments - 107 > 0) {
-                raf.seek(before + segments - 107);
+        final long endOffset;
+        try (RandomAccessFile raf = new RandomAccessFile(FILE, "r")) {
+            FileChannel fileChannel = raf.getChannel();
+            length = raf.length();
+            // Mapped via the (final since Java 22) FFM API. All reads below are bounds-checked
+            // MemorySegment copies, so no sun.misc.Unsafe is needed.
+            mapped = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, length, Arena.global());
+            endOffset = length - 1;
+            cores = length > 1000 ? Runtime.getRuntime().availableProcessors() : 1;
+            boundary = new long[cores][2];
+            long segments = length / (cores);
+            for (int i = 0; i < cores - 1; i++) {
+                boundary[i][0] = before + 1;
+                if (before + segments - 107 > 0) {
+                    raf.seek(before + segments - 107);
+                }
+                else {
+                    raf.seek(0);
+                }
+                while (raf.read() != '\n') {
+                }
+                boundary[i][1] = raf.getChannel().position() - 1;
+                before = boundary[i][1];
             }
-            else {
-                raf.seek(0);
-            }
-            while (raf.read() != '\n') {
-            }
-            boundary[i][1] = raf.getChannel().position() - 1;
-            before = boundary[i][1];
         }
         boundary[cores - 1][0] = before + 1;
         boundary[cores - 1][1] = length - 1;
 
-        int l3Size = (12 * 1024 * 1024);// unsafe.l3Size();
+        int l3Size = (12 * 1024 * 1024);
 
-        System.out.println(new TreeMap((Arrays.stream(boundary).parallel().map(i -> {
+        System.out.println(new TreeMap<>((Arrays.stream(boundary).parallel().map(i -> {
             try {
                 int seglen = (int) (i[1] - i[0] + 1);
                 HashMap<modifiedbytearray, MeasurementAggregator> resultmap = new HashMap<>(4000);
-                long segstart = mappedAddress + i[0];
+                long segOffset = i[0];
                 int bytesRemaining = seglen;
                 long num = 0;
                 boolean isNumber = false;
@@ -159,20 +135,16 @@ public class CalculateAverage_karthikeyan97 {
                 int sign = 1;
                 modifiedbytearray stationName = null;
                 int hascode = 5381;
-                // System.out.println("start:" + System.nanoTime() / 1000000);
                 while (bytesRemaining > 0) {
                     int bytesptr = 0;
-                    // int bytesread = buffer.remaining() > l3Size ? l3Size : buffer.remaining();
-                    // byte[] bufferArr = new byte[bytesread];
-                    // buffer.get(bufferArr);
                     int bbstart = 0;
                     int readSize = bytesRemaining > l3Size ? l3Size : bytesRemaining;
-                    int actualReadSize = (segstart + readSize + 110 > endAddress || readSize + 110 > i[1]) ? readSize : readSize + 110;
+                    int actualReadSize = (segOffset + readSize + 110 > endOffset || readSize + 110 > i[1]) ? readSize : readSize + 110;
                     byte[] readArr = new byte[actualReadSize];
 
-                    UNSAFE.copyMemory(null, segstart, readArr, UNSAFE.ARRAY_BYTE_BASE_OFFSET, actualReadSize);
+                    MemorySegment.copy(mapped, ValueLayout.JAVA_BYTE, segOffset, readArr, 0, actualReadSize);
                     while (bytesptr < actualReadSize) {
-                        bi = readArr[bytesptr++];// UNSAFE.getByte(segstart + bytesReading++);
+                        bi = readArr[bytesptr++];
                         if (!isNumber) {
                             while (bi != 59) {
                                 hascode = (hascode << 5) + hascode ^ bi;
@@ -224,116 +196,28 @@ public class CalculateAverage_karthikeyan97 {
                         }
                     }
                     bytesRemaining -= bytesptr;
-                    segstart += bytesptr;
+                    segOffset += bytesptr;
                 }
-                // System.out.println("end:" + System.nanoTime() / 1000000);
-                /*
-                 * while (bytesReading < (i[1] - i[0] + 1) && buffer.position() < buffer.limit()) {
-                 * buffer.clear();
-                 * bytesRead = fileChannel.read(buffer);
-                 * buffer.flip();
-                 * while (bytesReading <= (i[1] - i[0]) && buffer.position() < buffer.limit()) {
-                 * bytesReading += 1;
-                 * bi = buffer.get();
-                 * String s;
-                 * if (ctr > 0) {
-                 * hascode = 31 * hascode + bi;
-                 * ctr--;
-                 * }
-                 * else {
-                 * if (bi >= 240) {
-                 * ctr = 3;
-                 * }
-                 * else if (bi >= 224) {
-                 * ctr = 2;
-                 * }
-                 * else if (bi >= 192) {
-                 * ctr = 1;
-                 * }
-                 * else if (bi == 59) {
-                 * isNumber = true;
-                 * System.out.println(buffer);
-                 * stationName = new modifiedbytearray(bbstart, buffer.position() - 1, hascode, buffer);
-                 * hascode = 1;
-                 * bbstart = buffer.position();
-                 * }
-                 * else if (bi == 10) {
-                 * hascode = 1;
-                 * isNumber = false;
-                 * MeasurementAggregator agg = resultmap.get(stationName);
-                 * if (agg == null) {
-                 * agg = new MeasurementAggregator();
-                 * agg.min = num * sign;
-                 * agg.max = num * sign;
-                 * agg.sum = (long) (num * sign);
-                 * agg.count = 1;
-                 * resultmap.put(stationName, agg);
-                 * }
-                 * else {
-                 * agg.min = Math.min(agg.min, num * sign);
-                 * agg.max = Math.max(agg.max, num * sign);
-                 * agg.sum += (long) (num * sign);
-                 * agg.count++;
-                 * }
-                 * num = 1;
-                 * bbstart = buffer.position();
-                 * }
-                 * else {
-                 * hascode = 31 * hascode + bi;
-                 * if (isNumber) {
-                 * switch (bi) {
-                 * case 0x2E:
-                 * break;
-                 * case 0x2D:
-                 * num = num * -1;
-                 * break;
-                 * default:
-                 * num = num * 10 + (bi - 0x30);
-                 * }
-                 * }
-                 * }
-                 * }
-                 * }
-                 * }
-                 */
                 return resultmap;
             }
             catch (Exception e) {
                 e.printStackTrace();
             }
             return null;
-        }).flatMap(e -> e.entrySet().stream()).collect(groupingBy(e -> e.getKey(), collector)))) {
-            @Override
-            public Object put(Object key, Object value) {
-                return super.put(((modifiedbytearray) key).getStationName(), value);
-            }
-        });
-
-        /*
-         * .map(a -> {
-         * return a.stream().parallel().collect(groupingBy(m -> m.station(), collector));
-         * }).flatMap(m -> m.entrySet()
-         * .stream()
-         */
-        // Get the FileChannel from the FileInputStream
-
-        // System.out.println("time taken1:" + (System.nanoTime() - start) / 1000000);
-        // System.out.println(measurements);
+        }).flatMap(e -> e.entrySet().stream()).collect(groupingBy(e -> e.getKey().getStationName(), collector)))));
     }
 
 }
 
-class modifiedbytearray {
+class modifiedbytearray implements Comparable<modifiedbytearray> {
     private int length;
     private int start;
-    private int end;
     private byte[] arr;
     public int hashcode;
 
     modifiedbytearray(byte[] arr, int start, int end, int hashcode) {
         this.arr = arr;
         this.length = end - start + 1;
-        this.end = end;
         this.start = start;
         this.hashcode = hashcode;
     }
@@ -353,8 +237,22 @@ class modifiedbytearray {
 
     @Override
     public boolean equals(Object obj) {
-        modifiedbytearray b = (modifiedbytearray) obj;
-        return Arrays.equals(this.getArr(), start, end, b.arr, b.start, b.end);
+        if (this == obj) {
+            return true;
+        }
+        if (!(obj instanceof modifiedbytearray b)) {
+            return false;
+        }
+        // Arrays.equals(..., from, to, ...) treats "to" as exclusive; 'end' here is the last
+        // index (inclusive), so use start + length to compare every byte of the name.
+        return length == b.length
+                && Arrays.equals(arr, start, start + length, b.arr, b.start, b.start + b.length);
+    }
+
+    @Override
+    public int compareTo(modifiedbytearray other) {
+        // High-performance array comparison (available since Java 9)
+        return Arrays.compare(this.getArr(), other.getArr());
     }
 
     public int getHashcode() {

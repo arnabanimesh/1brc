@@ -15,27 +15,42 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+/**
+ * Same algorithm as the original, but memory is accessed through the Foreign
+ * Function &amp; Memory API (java.lang.foreign, final since JDK 22) instead of
+ * sun.misc.Unsafe, whose memory-access methods are terminally deprecated
+ * (JEP 471 / JEP 498) and are being phased out.
+ *
+ * Requires JDK 22+. No --enable-native-access or --add-exports flags needed.
+ */
 public class CalculateAverage_JamalMulla {
 
     private static final long ALL_SEMIS = 0x3B3B3B3B3B3B3B3BL;
     private static final Map<String, ResultRow> global = new TreeMap<>();
     private static final String FILE = "./measurements.txt";
-    private static final Unsafe UNSAFE = initUnsafe();
     private static final Lock lock = new ReentrantLock();
     private static final long FXSEED = 0x517cc1b727220a95L;
+
+    // The word-at-a-time tricks below assume little-endian byte order, so say so explicitly
+    // rather than relying on the platform's native order.
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
 
     private static final long[] masks = {
             0x0,
@@ -48,22 +63,12 @@ public class CalculateAverage_JamalMulla {
             0x00FFFFFFFFFFFFFFL
     };
 
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     private static final class ResultRow {
         private int min;
         private int max;
         private long sum;
         private int count;
+        // offset of the station name within the mapped file
         private final long keyStart;
         private final byte keyLength;
 
@@ -86,33 +91,51 @@ public class CalculateAverage_JamalMulla {
 
     }
 
-    private record Chunk(Long start, Long length) {
+    // [start, end) byte offsets into the mapped file; end is just past a '\n' (or EOF)
+    private record Chunk(long start, long end) {
     }
 
-    static Chunk[] getChunks(int numThreads, FileChannel channel) throws IOException {
-        // get all chunk boundaries
-        final long filebytes = channel.size();
-        final long roughChunkSize = filebytes / numThreads;
-        final Chunk[] chunks = new Chunk[numThreads];
-        final long mappedAddress = channel.map(FileChannel.MapMode.READ_ONLY, 0, filebytes, Arena.global()).address();
-        long chunkStart = 0;
-        long chunkLength = Math.min(filebytes - chunkStart - 1, roughChunkSize);
-        int i = 0;
-        while (chunkStart < filebytes) {
-            while (UNSAFE.getByte(mappedAddress + chunkStart + chunkLength) != 0xA /* \n */) {
-                chunkLength++;
+    static List<Chunk> getChunks(int numThreads, MemorySegment file) {
+        final long size = file.byteSize();
+        final long roughChunkSize = Math.max(1, size / numThreads);
+        final List<Chunk> chunks = new ArrayList<>(numThreads);
+
+        long start = 0;
+        while (start < size) {
+            long end = Math.min(start + roughChunkSize, size);
+            // extend to the end of the current line
+            while (end < size && file.get(BYTE, end - 1) != 0xA /* \n */) {
+                end++;
             }
-
-            chunks[i++] = new Chunk(mappedAddress + chunkStart, chunkLength + 1);
-            // to skip the nl in the next chunk
-            chunkStart += chunkLength + 1;
-            chunkLength = Math.min(filebytes - chunkStart - 1, roughChunkSize);
+            chunks.add(new Chunk(start, end));
+            start = end;
         }
-
         return chunks;
     }
 
-    private static void run(Chunk chunk) {
+    /**
+     * Reads 8 bytes at {@code offset}. The hot loop deliberately reads whole words, which can
+     * overshoot the end of the file by a few bytes on the very last line. Unsafe silently allowed
+     * that; MemorySegment bounds-checks, so near EOF we assemble the word byte by byte and
+     * zero-fill the missing bytes.
+     */
+    private static long getWord(MemorySegment file, long offset) {
+        if (offset <= file.byteSize() - Long.BYTES) {
+            return file.get(LONG_LE, offset);
+        }
+        return getWordNearEnd(file, offset);
+    }
+
+    private static long getWordNearEnd(MemorySegment file, long offset) {
+        long word = 0;
+        final long n = Math.min(Long.BYTES, file.byteSize() - offset);
+        for (long k = 0; k < n; k++) {
+            word |= (file.get(BYTE, offset + k) & 0xFFL) << (k * 8);
+        }
+        return word;
+    }
+
+    private static void run(MemorySegment file, Chunk chunk) {
 
         // can't have more than 10000 unique keys but want to match max hash
         final int MAPSIZE = 65536;
@@ -123,7 +146,7 @@ public class CalculateAverage_JamalMulla {
         long hash;
 
         long i = chunk.start;
-        final long cl = chunk.start + chunk.length;
+        final long cl = chunk.end;
         long word;
         long hs;
         long start;
@@ -136,7 +159,7 @@ public class CalculateAverage_JamalMulla {
             start = i;
             hash = 0;
 
-            word = UNSAFE.getLong(i);
+            word = getWord(file, i);
 
             while (true) {
                 n = word ^ ALL_SEMIS;
@@ -145,7 +168,7 @@ public class CalculateAverage_JamalMulla {
                     break;
                 hash = (hash ^ word) * FXSEED;
                 i += 8;
-                word = UNSAFE.getLong(i);
+                word = getWord(file, i);
             }
 
             i += Long.numberOfTrailingZeros(hs) >> 3;
@@ -155,33 +178,33 @@ public class CalculateAverage_JamalMulla {
             nameLength = (byte) (i++ - start);
 
             // temperature value follows
-            c = UNSAFE.getByte(i++);
+            c = file.get(BYTE, i++);
             // we know the val has to be between -99.9 and 99.8
             // always with a single fractional digit
             // represented as a byte array of either 4 or 5 characters
             if (c != 0x2D /* minus sign */) {
                 // could be either n.x or nn.x
-                if (UNSAFE.getByte(i + 2) == 0xA) {
+                if (file.get(BYTE, i + 2) == 0xA) {
                     temp = (c - 48) * 10; // char 1
                 }
                 else {
                     temp = (c - 48) * 100; // char 1
-                    temp += (UNSAFE.getByte(i++) - 48) * 10; // char 2
+                    temp += (file.get(BYTE, i++) - 48) * 10; // char 2
                 }
-                temp += (UNSAFE.getByte(++i) - 48); // char 3
+                temp += (file.get(BYTE, ++i) - 48); // char 3
             }
             else {
                 // could be either n.x or nn.x
-                if (UNSAFE.getByte(i + 3) == 0xA) {
-                    temp = (UNSAFE.getByte(i) - 48) * 10; // char 1
+                if (file.get(BYTE, i + 3) == 0xA) {
+                    temp = (file.get(BYTE, i) - 48) * 10; // char 1
                     i += 2;
                 }
                 else {
-                    temp = (UNSAFE.getByte(i) - 48) * 100; // char 1
-                    temp += (UNSAFE.getByte(i + 1) - 48) * 10; // char 2
+                    temp = (file.get(BYTE, i) - 48) * 100; // char 1
+                    temp += (file.get(BYTE, i + 1) - 48) * 10; // char 2
                     i += 3;
                 }
-                temp += (UNSAFE.getByte(i) - 48); // char 2
+                temp += (file.get(BYTE, i) - 48); // char 2
                 temp = -temp;
             }
             i += 2;
@@ -190,7 +213,7 @@ public class CalculateAverage_JamalMulla {
             slot = (int) (hash ^ hash >> 32) & 65535;
 
             // Linear probe for open slot
-            while ((slotValue = slots[slot]) != null && (slotValue.keyLength != nameLength || !unsafeEquals(slotValue.keyStart, start, nameLength))) {
+            while ((slotValue = slots[slot]) != null && (slotValue.keyLength != nameLength || !keyEquals(file, slotValue.keyStart, start, nameLength))) {
                 slot = (slot + 1) % MAPSIZE;
             }
 
@@ -222,7 +245,7 @@ public class CalculateAverage_JamalMulla {
                 if (resultRow != null) {
                     bytes = new byte[resultRow.keyLength];
                     // copy the name bytes
-                    UNSAFE.copyMemory(null, resultRow.keyStart, bytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, resultRow.keyLength);
+                    MemorySegment.copy(file, BYTE, resultRow.keyStart, bytes, 0, resultRow.keyLength);
                     key = new String(bytes, StandardCharsets.UTF_8);
                     if ((rr = global.get(key)) != null) {
                         rr.min = Math.min(rr.min, resultRow.min);
@@ -242,38 +265,45 @@ public class CalculateAverage_JamalMulla {
 
     }
 
-    static boolean unsafeEquals(final long a_address, final long b_address, final byte b_length) {
+    static boolean keyEquals(MemorySegment file, final long a_offset, final long b_offset, final byte b_length) {
         // byte by byte comparisons are slow, so do as big chunks as possible
         byte i = 0;
         for (; i < (b_length & -8); i += 8) {
-            if (UNSAFE.getLong(a_address + i) != UNSAFE.getLong(b_address + i)) {
+            if (getWord(file, a_offset + i) != getWord(file, b_offset + i)) {
                 return false;
             }
         }
         if (i == b_length)
             return true;
-        return (UNSAFE.getLong(a_address + i) & masks[b_length - i]) == (UNSAFE.getLong(b_address + i) & masks[b_length - i]);
+        final long mask = masks[b_length - i];
+        return (getWord(file, a_offset + i) & mask) == (getWord(file, b_offset + i) & mask);
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        int numThreads = 1;
-        FileChannel channel = new RandomAccessFile(FILE, "r").getChannel();
-        if (channel.size() > 64000) {
-            numThreads = Runtime.getRuntime().availableProcessors();
+        // The shared arena owns the mapping; it is closed (and the file unmapped)
+        // only after every worker thread has finished.
+        try (FileChannel channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ);
+                Arena arena = Arena.ofShared()) {
+
+            final MemorySegment file = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), arena);
+
+            int numThreads = 1;
+            if (file.byteSize() > 64000) {
+                numThreads = Runtime.getRuntime().availableProcessors();
+            }
+
+            final List<Chunk> chunks = getChunks(numThreads, file);
+            final List<Thread> threads = new ArrayList<>(chunks.size());
+            for (Chunk chunk : chunks) {
+                Thread thread = new Thread(() -> run(file, chunk));
+                thread.setPriority(Thread.MAX_PRIORITY);
+                thread.start();
+                threads.add(thread);
+            }
+            for (Thread t : threads) {
+                t.join();
+            }
+            System.out.println(global);
         }
-        Chunk[] chunks = getChunks(numThreads, channel);
-        Thread[] threads = new Thread[chunks.length];
-        for (int i = 0; i < chunks.length; i++) {
-            int finalI = i;
-            Thread thread = new Thread(() -> run(chunks[finalI]));
-            thread.setPriority(Thread.MAX_PRIORITY);
-            thread.start();
-            threads[i] = thread;
-        }
-        for (Thread t : threads) {
-            t.join();
-        }
-        System.out.println(global);
-        channel.close();
     }
 }

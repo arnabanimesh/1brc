@@ -16,8 +16,21 @@
 package dev.morling.onebrc;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
-import java.util.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.List;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.TreeMap;
+import java.util.HashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -35,15 +48,44 @@ import java.util.concurrent.atomic.AtomicLong;
  *  Jaromir Hamala for showing that avoiding the branch misprediction between <8 and 8-16 cases is a big win even if
  *  more work is performed
  *  Van Phu DO for demonstrating the lookup tables based on masks instead of bit shifting
+ *
+ * Port note: sun.misc.Unsafe has been replaced with the Foreign Function & Memory API (java.lang.foreign, final since
+ * Java 22). All former absolute addresses are now offsets into the mapped {@link MemorySegment}. Because segment
+ * accesses are bounds checked, the SWAR fast path only runs over the "body" of the file (everything up to the last
+ * newline that is at least {@link #TAIL_SAFETY} bytes before the end); the remaining few lines are handled by a plain
+ * scalar loop. No restricted FFM methods are used, so --enable-native-access is not required.
  */
 public class CalculateAverage_thomaswue {
     private static final String FILE = "./measurements.txt";
     private static final int MIN_TEMP = -999;
     private static final int MAX_TEMP = 999;
-    private static final int MAX_NAME_LENGTH = 100;
     private static final int MAX_CITIES = 10000;
     private static final int SEGMENT_SIZE = 1 << 21;
     private static final int HASH_TABLE_SIZE = 1 << 17;
+
+    // The fast path may read up to ~16 bytes past the end of a line. A line is at most ~107 bytes, so this margin keeps
+    // every read of the fast path inside the file.
+    private static final int TAIL_SAFETY = 128;
+
+    // The parsing code assumes little endian word layout, so make that explicit.
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    /**
+     * Holder class so that the file is only mapped in the worker process (the parent never touches this class).
+     */
+    private static final class Input {
+        static final MemorySegment SEGMENT = map();
+        static final long SIZE = SEGMENT.byteSize();
+
+        private static MemorySegment map() {
+            try (FileChannel channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+                return channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size(), Arena.global());
+            }
+            catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+    }
 
     public static void main(String[] args) throws IOException, InterruptedException {
         // Start worker subprocess if this process is not the worker.
@@ -53,32 +95,33 @@ public class CalculateAverage_thomaswue {
         }
 
         int numberOfWorkers = Runtime.getRuntime().availableProcessors();
-        try (var fileChannel = FileChannel.open(java.nio.file.Path.of(FILE), java.nio.file.StandardOpenOption.READ)) {
-            long fileSize = fileChannel.size();
-            final long fileStart = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, java.lang.foreign.Arena.global()).address();
-            final long fileEnd = fileStart + fileSize;
-            final AtomicLong cursor = new AtomicLong(fileStart);
+        final long fileSize = Input.SIZE;
+        final long bodyEnd = findBodyEnd(fileSize);
+        final AtomicLong cursor = new AtomicLong(0);
 
-            // Parallel processing of segments.
-            Thread[] threads = new Thread[numberOfWorkers];
-            List<Result>[] allResults = new List[numberOfWorkers];
-            for (int i = 0; i < threads.length; ++i) {
-                final int index = i;
-                threads[i] = new Thread(() -> {
-                    List<Result> results = new ArrayList<>(MAX_CITIES);
-                    parseLoop(cursor, fileEnd, fileStart, results);
-                    allResults[index] = results;
-                });
-                threads[i].start();
-            }
-            for (Thread thread : threads) {
-                thread.join();
-            }
-
-            // Final output.
-            System.out.println(accumulateResults(allResults));
-            System.out.close();
+        // Parallel processing of segments.
+        Thread[] threads = new Thread[numberOfWorkers];
+        @SuppressWarnings("unchecked")
+        List<Result>[] allResults = new List[numberOfWorkers];
+        for (int i = 0; i < threads.length; ++i) {
+            final int index = i;
+            threads[i] = new Thread(() -> {
+                List<Result> results = new ArrayList<>(MAX_CITIES);
+                parseLoop(cursor, bodyEnd, results);
+                allResults[index] = results;
+            });
+            threads[i].start();
         }
+        for (Thread thread : threads) {
+            thread.join();
+        }
+
+        // The last few lines of the file are processed with a simple, bounds-safe scalar loop.
+        Map<String, Result> tailResults = processTail(bodyEnd, fileSize);
+
+        // Final output.
+        System.out.println(accumulateResults(allResults, tailResults));
+        System.out.close();
     }
 
     private static void spawnWorker() throws IOException {
@@ -91,7 +134,7 @@ public class CalculateAverage_thomaswue {
                 .start().getInputStream().transferTo(System.out);
     }
 
-    private static TreeMap<String, Result> accumulateResults(List<Result>[] allResults) {
+    private static TreeMap<String, Result> accumulateResults(List<Result>[] allResults, Map<String, Result> tailResults) {
         TreeMap<String, Result> result = new TreeMap<>();
         for (List<Result> resultArr : allResults) {
             for (Result r : resultArr) {
@@ -101,24 +144,78 @@ public class CalculateAverage_thomaswue {
                 }
             }
         }
+        for (Map.Entry<String, Result> e : tailResults.entrySet()) {
+            Result current = result.putIfAbsent(e.getKey(), e.getValue());
+            if (current != null) {
+                current.accumulate(e.getValue());
+            }
+        }
         return result;
     }
 
-    private static void parseLoop(AtomicLong counter, long fileEnd, long fileStart, List<Result> collectedResults) {
+    /**
+     * Returns the offset just after the last newline that lies at least TAIL_SAFETY bytes before the end of the file,
+     * or 0 if there is no such newline (small files are then handled entirely by the scalar tail loop).
+     */
+    private static long findBodyEnd(long fileSize) {
+        for (long i = fileSize - TAIL_SAFETY; i >= 0; i--) {
+            if (byteAt(i) == '\n') {
+                return i + 1;
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Plain byte-by-byte parser for the lines in [start, end). Slow, but only ever sees a handful of lines.
+     */
+    private static Map<String, Result> processTail(long start, long end) {
+        Map<String, Result> tail = new HashMap<>();
+        long pos = start;
+        while (pos < end) {
+            long nameStart = pos;
+            while (byteAt(pos) != ';') {
+                pos++;
+            }
+            String name = new String(Input.SEGMENT.asSlice(nameStart, pos - nameStart).toArray(ValueLayout.JAVA_BYTE),
+                    StandardCharsets.UTF_8);
+            pos++; // skip ';'
+            boolean negative = false;
+            if (byteAt(pos) == '-') {
+                negative = true;
+                pos++;
+            }
+            int value = 0;
+            while (pos < end && byteAt(pos) != '\n') {
+                byte b = byteAt(pos++);
+                if (b != '.') {
+                    value = value * 10 + (b - '0');
+                }
+            }
+            pos++; // skip '\n'
+            record(tail.computeIfAbsent(name, k -> new Result()), negative ? -value : value);
+        }
+        return tail;
+    }
+
+    private static void parseLoop(AtomicLong counter, long bodyEnd, List<Result> collectedResults) {
         Result[] results = new Result[HASH_TABLE_SIZE];
         while (true) {
             long current = counter.addAndGet(SEGMENT_SIZE) - SEGMENT_SIZE;
-            if (current >= fileEnd) {
+            if (current >= bodyEnd) {
                 return;
             }
 
-            long segmentEnd = nextNewLine(Math.min(fileEnd - 1, current + SEGMENT_SIZE));
+            long segmentEnd = nextNewLine(Math.min(bodyEnd - 1, current + SEGMENT_SIZE));
             long segmentStart;
-            if (current == fileStart) {
+            if (current == 0) {
                 segmentStart = current;
             }
             else {
                 segmentStart = nextNewLine(current) + 1;
+            }
+            if (segmentStart > segmentEnd) {
+                continue;
             }
 
             long dist = (segmentEnd - segmentStart) / 3;
@@ -195,7 +292,7 @@ public class CalculateAverage_thomaswue {
         long word = initialWord;
         long delimiterMask = initialDelimiterMask;
         long hash;
-        long nameAddress = scanner.pos();
+        long nameOffset = scanner.pos();
         long word2 = wordB;
         long delimiterMask2 = delimiterMaskB;
         if ((delimiterMask | delimiterMask2) != 0) {
@@ -233,19 +330,19 @@ public class CalculateAverage_thomaswue {
         }
 
         // Save length of name for later.
-        int nameLength = (int) (scanner.pos() - nameAddress);
+        int nameLength = (int) (scanner.pos() - nameOffset);
 
         // Final calculation for index into hash table.
         int tableIndex = hashToIndex(hash, results);
         outer: while (true) {
             existingResult = results[tableIndex];
             if (existingResult == null) {
-                existingResult = newEntry(results, nameAddress, tableIndex, nameLength, scanner, collectedResults);
+                existingResult = newEntry(results, nameOffset, tableIndex, nameLength, scanner, collectedResults);
             }
             // Check for collision.
             int i = 0;
             for (; i < nameLength + 1 - 8; i += 8) {
-                if (scanner.getLongAt(existingResult.nameAddress + i) != scanner.getLongAt(nameAddress + i)) {
+                if (scanner.getLongAt(existingResult.nameOffset + i) != scanner.getLongAt(nameOffset + i)) {
                     // Collision error, try next.
                     tableIndex = (tableIndex + 31) & (results.length - 1);
                     continue outer;
@@ -253,7 +350,7 @@ public class CalculateAverage_thomaswue {
             }
 
             int remainingShift = (64 - ((nameLength + 1 - i) << 3));
-            if (((scanner.getLongAt(existingResult.nameAddress + i) ^ (scanner.getLongAt(nameAddress + i))) << remainingShift) == 0) {
+            if (((scanner.getLongAt(existingResult.nameOffset + i) ^ (scanner.getLongAt(nameOffset + i))) << remainingShift) == 0) {
                 break;
             }
             else {
@@ -266,7 +363,7 @@ public class CalculateAverage_thomaswue {
 
     private static long nextNewLine(long prev) {
         while (true) {
-            long currentWord = Scanner.UNSAFE.getLong(prev);
+            long currentWord = longAt(prev);
             long input = currentWord ^ 0x0A0A0A0A0A0A0A0AL;
             long pos = (input - 0x0101010101010101L) & ~input & 0x8080808080808080L;
             if (pos != 0) {
@@ -324,12 +421,12 @@ public class CalculateAverage_thomaswue {
         return (input - 0x0101010101010101L) & ~input & 0x8080808080808080L;
     }
 
-    private static Result newEntry(Result[] results, long nameAddress, int hash, int nameLength, Scanner scanner, List<Result> collectedResults) {
+    private static Result newEntry(Result[] results, long nameOffset, int hash, int nameLength, Scanner scanner, List<Result> collectedResults) {
         Result r = new Result();
         results[hash] = r;
         int totalLength = nameLength + 1;
-        r.firstNameWord = scanner.getLongAt(nameAddress);
-        r.secondNameWord = scanner.getLongAt(nameAddress + 8);
+        r.firstNameWord = scanner.getLongAt(nameOffset);
+        r.secondNameWord = scanner.getLongAt(nameOffset + 8);
         if (totalLength <= 8) {
             r.firstNameWord = r.firstNameWord & MASK1[totalLength - 1];
             r.secondNameWord = 0;
@@ -337,9 +434,17 @@ public class CalculateAverage_thomaswue {
         else if (totalLength < 16) {
             r.secondNameWord = r.secondNameWord & MASK1[totalLength - 9];
         }
-        r.nameAddress = nameAddress;
+        r.nameOffset = nameOffset;
         collectedResults.add(r);
         return r;
+    }
+
+    private static long longAt(long offset) {
+        return Input.SEGMENT.get(LONG_LE, offset);
+    }
+
+    private static byte byteAt(long offset) {
+        return Input.SEGMENT.get(ValueLayout.JAVA_BYTE, offset);
     }
 
     private static final class Result {
@@ -347,7 +452,7 @@ public class CalculateAverage_thomaswue {
         short min, max;
         int count;
         long sum;
-        long nameAddress;
+        long nameOffset;
 
         private Result() {
             this.min = MAX_TEMP;
@@ -374,34 +479,18 @@ public class CalculateAverage_thomaswue {
         }
 
         public String calcName() {
-            Scanner scanner = new Scanner(nameAddress, nameAddress + MAX_NAME_LENGTH + 1);
             int nameLength = 0;
-            while (scanner.getByteAt(nameAddress + nameLength) != ';') {
+            while (byteAt(nameOffset + nameLength) != ';') {
                 nameLength++;
             }
-            byte[] array = new byte[nameLength];
-            for (int i = 0; i < nameLength; ++i) {
-                array[i] = scanner.getByteAt(nameAddress + i);
-            }
-            return new String(array, java.nio.charset.StandardCharsets.UTF_8);
+            byte[] array = Input.SEGMENT.asSlice(nameOffset, nameLength).toArray(ValueLayout.JAVA_BYTE);
+            return new String(array, StandardCharsets.UTF_8);
         }
     }
 
     private static final class Scanner {
-        private static final sun.misc.Unsafe UNSAFE = initUnsafe();
         private long pos;
         private final long end;
-
-        private static sun.misc.Unsafe initUnsafe() {
-            try {
-                java.lang.reflect.Field theUnsafe = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
-                theUnsafe.setAccessible(true);
-                return (sun.misc.Unsafe) theUnsafe.get(sun.misc.Unsafe.class);
-            }
-            catch (NoSuchFieldException | IllegalAccessException e) {
-                throw new RuntimeException(e);
-            }
-        }
 
         public Scanner(long start, long end) {
             this.pos = start;
@@ -421,15 +510,11 @@ public class CalculateAverage_thomaswue {
         }
 
         long getLong() {
-            return UNSAFE.getLong(pos);
+            return longAt(pos);
         }
 
         long getLongAt(long pos) {
-            return UNSAFE.getLong(pos);
-        }
-
-        byte getByteAt(long pos) {
-            return UNSAFE.getByte(pos);
+            return longAt(pos);
         }
     }
 }

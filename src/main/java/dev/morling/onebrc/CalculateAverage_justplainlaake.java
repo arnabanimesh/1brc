@@ -17,7 +17,9 @@ package dev.morling.onebrc;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -31,11 +33,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
-import sun.misc.Unsafe;
-
 /*
     Possibilities to improve:
-        * Reduce Standard Memory Reads and/or Swaps for threading 
+        * Reduce Standard Memory Reads and/or Swaps for threading
             - For the read file; using Unsafe or MemorySegment to map the file to an existing register instead of keeping the bytes local
             - For normal variables; Most of the time reading a value performs a load from memory and registers it for faster lookups, but with multithreading causes each thread to re read and register each get [volatile] keyword
         * Add multithreading to process multiple segments at once (When you have 1,000,000,000 cars driving might as well open as many lanes as possible)
@@ -77,6 +77,15 @@ import sun.misc.Unsafe;
             * 2,307.3038ms
         - Me run 6 (Remove use of math.min and math.max in favor of ternary operator (Reduces getStatic operation))
             * 2,265.3521ms
+
+    Java 27 migration notes (the runs above were measured with sun.misc.Unsafe and have NOT been re-measured):
+        * sun.misc.Unsafe memory access is deprecated for removal (JEP 471), warns at runtime (JEP 498) and is on the path to deny/removal,
+          so all file access now goes through the standard Foreign Function & Memory API (java.lang.foreign, final since JDK 22).
+        * "Addresses" in this file are now byte offsets into the mapped MemorySegment rather than raw native addresses.
+        * Unsafe never bounds-checked, so the old code could read up to 7 bytes past the end of the mapping. MemorySegment does check, so every
+          long read goes through readLong(), which falls back to a zero-padded byte-wise read for the last few bytes of the file.
+        * Reads use an explicit little-endian layout; getMaskOffset and the number parsing assume byte 0 is the lowest byte of the long.
+        * No restricted methods are used, so --enable-native-access is not required.
  */
 
 public class CalculateAverage_justplainlaake {
@@ -86,6 +95,9 @@ public class CalculateAverage_justplainlaake {
     private static final byte SEPERATOR_BYTE = ';';
     private static final byte NEW_LINE_BYTE = '\n';
     private static final DecimalFormat STATION_FORMAT = new DecimalFormat("#,##0.0");
+
+    // Unaligned little-endian long view; the parsing logic below depends on the first byte in memory being the lowest byte of the long
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     private static final long[] OFFSET_CLEARS = {
             0x0000000000000000L, // 8 Offset (Clear whole thing)
@@ -98,21 +110,6 @@ public class CalculateAverage_justplainlaake {
             0x00FFFFFFFFFFFFFFL,
             0xFFFFFFFFFFFFFFFFL,// 0 Offset (Clear nothing)
     };
-
-    private static final Unsafe UNSAFE;
-    static {
-        Unsafe _unsafe = null;
-        try {
-            Field unsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            unsafe.setAccessible(true);
-            _unsafe = (Unsafe) unsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | SecurityException | IllegalArgumentException | IllegalAccessException e) {
-            e.printStackTrace();
-            System.exit(1);
-        }
-        UNSAFE = _unsafe;// Just to get around "The blank final field UNSAFE may not have been initialized"
-    }
 
     public static void main(String[] args) throws IOException {
         int processors = Runtime.getRuntime().availableProcessors();
@@ -133,17 +130,20 @@ public class CalculateAverage_justplainlaake {
 
             long chunkSize = fileSize / processors;// Determine approximate size of each chunk based on amount of processors available
 
-            long startAddress = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global())// Map the file channel into memory using the global arena (accessible by all threads)
-                    .address();// And get the starting address of mapped section
+            // Map the file channel into memory using the global arena (accessible by all threads, never closed).
+            // The mapping stays valid after the channel is closed by the try-with-resources.
+            final MemorySegment segment = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
 
-            long endAddress = startAddress + fileSize;
+            // All "addresses" below are byte offsets into the segment
+            long startAddress = 0;
+            long endAddress = fileSize;
             long currentAddress = startAddress + chunkSize;
             long chunkStart = startAddress;
 
             for (int i = 0; i < processors; i++) {// We need to chunk the file for each processor/thread
 
                 while (currentAddress < endAddress) {// While loop to locate the next new line character from the chunk we are in
-                    long match = UNSAFE.getLong(currentAddress);// Read the next 8 bytes as a long from the memory address
+                    long match = readLong(segment, currentAddress);// Read the next 8 bytes as a long from the segment (bounds safe near the end of the file)
                     short offset = getMaskOffset(match, NEW_LINE_BYTE);// find the byte in the long which equals 10 aka '\n', if it is not found this returns -1
                     if (offset != -1) {// We found the offset, so add it to the current adress and break the while loop
                         currentAddress += offset;
@@ -156,10 +156,10 @@ public class CalculateAverage_justplainlaake {
                 // Also Math.min doesn't matter here since its called x times where x = count of processors
 
                 if (i == processors - 1) {// if on last processor use main thread to optimize threading, doing on last processor means the others are already processing while this runs
-                    mainMap = process(finalChunkStart, finalChunkEnd);
+                    mainMap = process(segment, finalChunkStart, finalChunkEnd);
                 }
                 else {
-                    futures.add(e.submit(() -> process(finalChunkStart, finalChunkEnd)));
+                    futures.add(e.submit(() -> process(segment, finalChunkStart, finalChunkEnd)));
                 }
                 chunkStart = currentAddress + 1;// Advance the start of the next chunk to be the end of this chunk + 1 to move past the new line character
                 currentAddress = Math.min(currentAddress + chunkSize, endAddress);// Advance the next chunks end to be the end of the mapped file or the end of the approximated chunk
@@ -205,9 +205,9 @@ public class CalculateAverage_justplainlaake {
     }
 
     // Core processing functionality, processes a chunk of memory
-    private static OpenMap process(long fromAddress, long toAddress) {
+    private static OpenMap process(MemorySegment segment, long fromAddress, long toAddress) {
 
-        OpenMap stationsLookup = new OpenMap();// Create a new map for this specific chunk, this is also the returned value for the callable
+        OpenMap stationsLookup = new OpenMap(segment);// Create a new map for this specific chunk, this is also the returned value for the callable
 
         long blockStart = fromAddress;
         long currentAddress = fromAddress;
@@ -219,7 +219,7 @@ public class CalculateAverage_justplainlaake {
             // The hash is a long hash based on the murmur3 algorithm. Look at the getMurmurHash3 method to find link
             long hash = 1;
 
-            while ((offset = getMaskOffset(read = UNSAFE.getLong(currentAddress), SEPERATOR_BYTE)) == -1) {// Read and compute the hash until we locate the seperator byte 59 or ';'
+            while ((offset = getMaskOffset(read = readLong(segment, currentAddress), SEPERATOR_BYTE)) == -1) {// Read and compute the hash until we locate the seperator byte 59 or ';'
                 currentAddress += 8;// forwardscan
                 hash = (997 * hash) ^ getMurmurHash3(991 * read);
             }
@@ -244,7 +244,7 @@ public class CalculateAverage_justplainlaake {
             // Encoding is UTF8 however, since numbers in UTF8 are all single byte characters we can do some byte math to determin the number; 0=48 and 9=57, so character - 48 = number
             // And since - and . are also single byte characters we can make some assumptions, leading us with the primary one that no matter what the number will be 3 to 5 bytes (see above combinations)
             // Unfortunately since an integer is only 4 bytes we must read the long; Something to test would be to see if we could read an integer and then read an extra byte if it is the 5 character edge case
-            read = UNSAFE.getLong(currentAddress);
+            read = readLong(segment, currentAddress);
 
             offset = 0;// reinitiate the offset to reuse the local address
 
@@ -276,6 +276,24 @@ public class CalculateAverage_justplainlaake {
         return stationsLookup;
     }
 
+    // Reads 8 bytes (little-endian) starting at the given offset. Unlike Unsafe, MemorySegment bounds-checks, so for the last <8 bytes of the file
+    // we fall back to a slow path that zero-pads the missing bytes. The slow path is only ever hit a handful of times per run.
+    private static long readLong(MemorySegment segment, long offset) {
+        if (offset + Long.BYTES <= segment.byteSize()) {
+            return segment.get(LONG_LE, offset);
+        }
+        return readLongTail(segment, offset);
+    }
+
+    private static long readLongTail(MemorySegment segment, long offset) {
+        long available = Math.min(Long.BYTES, segment.byteSize() - offset);
+        long result = 0;
+        for (int i = 0; i < available; i++) {
+            result |= (segment.get(ValueLayout.JAVA_BYTE, offset + i) & 0xFFL) << (i * 8);
+        }
+        return result;
+    }
+
     // Avalanche hashing function for longs: https://github.com/aappleby/smhasher/blob/master/README.md
     public final static long getMurmurHash3(long x) {
         x ^= x >>> 33;
@@ -299,7 +317,7 @@ public class CalculateAverage_justplainlaake {
     }
 
     private static class Station {
-        private final long nameStart, nameEnd;// Store the starting and ending address of the name, to fill it later
+        private final long nameStart, nameEnd;// Store the starting and ending offset of the name, to fill it later
         private final int nameLength;
         private int min = Integer.MAX_VALUE, max = Integer.MIN_VALUE, count;
         private long sum;
@@ -311,9 +329,9 @@ public class CalculateAverage_justplainlaake {
             this.nameLength = (int) (nameEnd - nameStart) + 1;// Add 1 to include seperator
         }
 
-        protected void fillName() {
-            byte[] nameBuffer = new byte[(int) (nameEnd - nameStart)];
-            UNSAFE.copyMemory(null, this.nameStart, nameBuffer, Unsafe.ARRAY_BYTE_BASE_OFFSET, nameBuffer.length);// Quick memory copy, using null as src copies from the file we mapped earlier
+        protected void fillName(MemorySegment segment) {
+            // Copy the name bytes out of the mapped file
+            byte[] nameBuffer = segment.asSlice(this.nameStart, nameEnd - nameStart).toArray(ValueLayout.JAVA_BYTE);
             name = new String(nameBuffer, StandardCharsets.UTF_8);
         }
 
@@ -329,6 +347,8 @@ public class CalculateAverage_justplainlaake {
         public static final float LOAD_FACTOR = 0.75f;
         public static final int EXPECTED_INITIAL_SIZE = 100_000;
 
+        private final MemorySegment segment;// The mapped file, needed to compare names and to materialize them at the end
+
         protected transient long[] keys;// Use unboxed long values as a key, faster than a doing new HashMap<Long,X>() as with generics it will box/unbox every action (can be costly in large quantities)
         protected transient Station[] values;
         protected transient int capacity;
@@ -336,7 +356,8 @@ public class CalculateAverage_justplainlaake {
         protected transient int mask;
         protected int size;
 
-        public OpenMap() {
+        public OpenMap(MemorySegment segment) {
+            this.segment = segment;
             // capacity = (int) getNextPowerOfTwo((long) Math.ceil(EXPECTED_INITIAL_SIZE / LOAD_FACTOR));// need to base the capacity on the next power of two for the mask to work properly
             // initial size of 100k gives 262,144 Capacity, since we know this and its way oversized for a max of 10k keys theres no need to recalculate
             capacity = 262_144;
@@ -404,7 +425,7 @@ public class CalculateAverage_justplainlaake {
             for (int i = 0; i < capacity; i++) {
                 if (values[i] != null) {
                     array[setter++] = values[i];
-                    values[i].fillName();
+                    values[i].fillName(segment);
                 }
             }
             return array;
@@ -425,14 +446,14 @@ public class CalculateAverage_justplainlaake {
         private boolean compareMemory(long start1, long start2, int length) {
             while (length > 0) {
                 if (length >= 8) {
-                    if (UNSAFE.getLong(start1) != UNSAFE.getLong(start2)) {
+                    if (readLong(segment, start1) != readLong(segment, start2)) {
                         return false;
                     }
                 }
                 else {
-                    if ((UNSAFE.getLong(start1) & OFFSET_CLEARS[length]) != (UNSAFE.getLong(start2) & OFFSET_CLEARS[length])) {
+                    if ((readLong(segment, start1) & OFFSET_CLEARS[length]) != (readLong(segment, start2) & OFFSET_CLEARS[length])) {
                         System.out.println("Found collision: " + start1 + ": " + start2);
-                        System.out.println("Found collision: " + UNSAFE.getLong(start1) + ": " + UNSAFE.getLong(start2));
+                        System.out.println("Found collision: " + readLong(segment, start1) + ": " + readLong(segment, start2));
                         System.out.println("Length: " + length);
                         return false;
                     }

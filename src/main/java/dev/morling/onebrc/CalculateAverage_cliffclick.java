@@ -15,52 +15,55 @@
  */
 package dev.morling.onebrc;
 
-import java.io.*;
-import java.lang.reflect.Field;
-import java.nio.MappedByteBuffer;
+import java.io.File;
+import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
-import java.nio.file.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
-import sun.misc.Unsafe;
+import java.util.Locale;
 
+/*
+ * JDK 27 port.
+ *
+ * The original used sun.misc.Unsafe memory-access methods. Those were deprecated
+ * for removal in JDK 23 (JEP 471), warn at run time from JDK 24 (JEP 498), and
+ * throw UnsupportedOperationException by default from JDK 26. This version uses
+ * the standard Foreign Function & Memory API (final since JDK 22, JEP 454):
+ *
+ *   - FileChannel.map(mode, offset, size, Arena) gives a MemorySegment with a
+ *     long size, so the 1 GB MappedByteBuffer chunking is no longer needed.
+ *   - Unsafe.getLong/getByte become MemorySegment.get with unaligned layouts.
+ *   - The deprecated String(byte[],int,int,int) and String.getBytes(int,int,byte[],int)
+ *     are replaced by ISO_8859_1 equivalents (identical behaviour).
+ *
+ * Nothing used here is a restricted FFM method, so no --enable-native-access flag
+ * is required. Still assumes a little-endian platform, as the SWAR code did.
+ */
 abstract class CalculateAverage_cliffclick {
-    // abstract class CNC {
     public static final int NCPUS = Runtime.getRuntime().availableProcessors();
     public static final long HASSEMI = 0x3B3B3B3B3B3B3B3BL;
 
-    private static final Unsafe UNSAFE;
-    private static long MMAP_ADDRESS;
-    static {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            UNSAFE = (Unsafe) theUnsafe.get(Unsafe.class);
+    // Unaligned, native-order accessors (the old Unsafe.getLong/getByte)
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
 
-            Field f;
-            try {
-                f = java.nio.Buffer.class.getDeclaredField("address");
-            }
-            catch (java.lang.NoSuchFieldException e) {
-                throw new RuntimeException(e);
-            }
-            MMAP_ADDRESS = UNSAFE.objectFieldOffset(f);
-
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    // Extra bytes mapped past a chunk so the last line starting inside it can be
+    // finished, and so the 8-byte SWAR reads stay in bounds.
+    private static final int PAD = 256;
 
     public static void main(String[] args) throws Exception {
         if (args.length < 1)
             args = new String[]{ "measurements.txt" };
 
         Work w = work(args);
-        String foo = w.toString();
-        byte[] bar = new byte[foo.length()];
-        foo.getBytes(0, foo.length(), bar, 0);
-        System.out.write(bar);
+        System.out.write(w.toString().getBytes(StandardCharsets.ISO_8859_1));
         System.out.write('\n');
+        System.out.flush();
     }
 
     // General work flow:
@@ -107,24 +110,18 @@ abstract class CalculateAverage_cliffclick {
     }
 
     static void tstart(Work w, File f, long start, long len) {
-        try {
-            // Thread gets a chunk of work
-            FileChannel fc = FileChannel.open(f.toPath(), StandardOpenOption.READ);
-            final int MAX_MAP = 1 << 30;
-
-            for (long s = start; s < start + len; s += MAX_MAP) {
-                int maxlen = (int) Math.min(len + 1, MAX_MAP); // Length capped at MAX_MAP
-                long rem = f.length() - s;
-                int mlen = (int) Math.min(rem, maxlen + 100); // Add a little extra so can finish out a line
-                int clen = (int) Math.min(rem, maxlen);
-                // mmap is capped at MAX_MAP (plus change), or
-                // to the end of the chosen parse length (plus change)
-                // or the end of the file in any case
-                MappedByteBuffer mmap = fc.map(FileChannel.MapMode.READ_ONLY, s, mlen);
-                // Chunk runs to min(MAX_MAP, parse length, eof), plus it runs to the end
-                // of any partial line.
-                do_chunk(w, s > 0, clen, mmap);
-            }
+        // The Arena is confined to this thread, which is also the only reader of the mapping.
+        try (FileChannel fc = FileChannel.open(f.toPath(), StandardOpenOption.READ);
+                Arena arena = Arena.ofConfined()) {
+            long rem = f.length() - start;
+            // Lines whose first byte is in [start, start+len] are ours. The +1 pairs with
+            // the next thread's skipFirst, which always discards the first line (or line
+            // fragment) of its chunk, including a line that begins exactly at its start.
+            long clen = Math.min(len + 1, rem);
+            // Map a little extra so we can finish out the last partial line.
+            long mlen = Math.min(rem, clen + PAD);
+            MemorySegment seg = fc.map(FileChannel.MapMode.READ_ONLY, start, mlen, arena);
+            do_chunk(w, start > 0, clen, seg);
         }
         catch (IOException ioe) {
             throw new RuntimeException(ioe);
@@ -136,35 +133,33 @@ abstract class CalculateAverage_cliffclick {
         return (x - 0x0101010101010101L) & (~x) & 0x8080808080808080L;
     }
 
-    // Parse a chunk, from 0 to limit in mmap. Runs past limit to finish any
+    // Parse a chunk, from 0 to limit in seg. Runs past limit to finish any
     // partial line. If skip1, then skip any leading partial line.
-    static void do_chunk(Work w, boolean skip1, int limit, MappedByteBuffer mmap) {
-        assert mmap.isDirect();
-        int idx = 0;
-        int max = mmap.limit();
-        long base = UNSAFE.getLong(mmap, MMAP_ADDRESS);
+    static void do_chunk(Work w, boolean skip1, long limit, MemorySegment seg) {
+        long idx = 0;
+        long max = seg.byteSize();
 
         // If start>0, skip until first newline
         if (skip1)
-            idx = skipFirst(idx, base);
+            idx = skipFirst(idx, seg);
 
         // The very last entry will want to fetch 8 bytes, some of which may go
-        // past the mmap max - do this entry now, before looping.
+        // past the segment end - do this entry now, before looping.
         if (limit == max)
-            limit = skipLast(limit, w, base);
+            limit = skipLast(limit, w, seg);
 
-        // Edges of the ~2G region taken care of. Now do the giant middle part.
+        // Edges of the region taken care of. Now do the giant middle part.
 
         // For this chunk of file do...
         while (idx < limit) {
-            int cityx = idx; // Used if we find a new city name
+            long cityx = idx; // Used if we find a new city name
 
             // SWAR read and build n8; the long-as-a-string value. Also track start
             // and end of the string, in case it is new and needs to be inserted into
             // the n8->city_name map.
             long n8 = 0;
             // Read a misaligned long
-            long x = UNSAFE.getLong(base + idx);
+            long x = seg.get(LONG, idx);
             // Found semi ?
             long hasM = has0(x ^ HASSEMI);
             while (hasM == 0) {
@@ -172,7 +167,7 @@ abstract class CalculateAverage_cliffclick {
                 n8 ^= x;
                 idx += 8;
                 // Read a misaligned long
-                x = UNSAFE.getLong(base + idx);
+                x = seg.get(LONG, idx);
                 // Found semi ?
                 hasM = has0(x ^ HASSEMI);
             }
@@ -181,7 +176,7 @@ abstract class CalculateAverage_cliffclick {
             int shr = Long.numberOfTrailingZeros(hasM) + 1;
             if (shr > 8) {
                 int shr2 = 72 - shr;
-                n8 ^= (x << shr2) >> shr2;
+                n8 ^= (x << shr2) >>> shr2; // unsigned: bytes >= 0x80 (UTF-8) must not sign-extend
                 idx += (shr >> 3) - 1;
             }
 
@@ -189,50 +184,50 @@ abstract class CalculateAverage_cliffclick {
             idx++;
 
             // Reading tempature, and add
-            idx = parseData(idx, w, cityx, n8, base);
+            idx = parseData(idx, w, cityx, n8, seg);
         }
     }
 
     // The very last entry will want to fetch 8 bytes, some of which may go
-    // past the mmap max - do this entry now, before looping.
-    private static int skipLast(int limit, Work w, long base) {
+    // past the segment end - do this entry now, before looping.
+    private static long skipLast(long limit, Work w, MemorySegment seg) {
         limit--;
-        while (limit > 0 && UNSAFE.getByte(base + limit - 1) != '\n')
+        while (limit > 0 && seg.get(BYTE, limit - 1) != '\n')
             limit--;
         long n8 = 0, mask = 0, c;
-        int i = limit;
-        while ((c = UNSAFE.getByte(base + i)) != ';') {
-            mask = (mask >> 8) | (c << 56);
+        long i = limit;
+        while ((c = seg.get(BYTE, i)) != ';') {
+            mask = (mask >>> 8) | ((c & 0xFF) << 56); // unsigned, to match the main loop
             i++;
             if (((limit - i) & 7) == 0) {
                 n8 ^= mask;
                 mask = 0;
             }
         }
-        int shr = (limit - i) & 7;
-        n8 ^= (mask >> (shr << 3));
-        parseData(i + 1, w, limit, n8, base);
+        int shr = (int) ((limit - i) & 7);
+        n8 ^= (mask >>> (shr << 3));
+        parseData(i + 1, w, limit, n8, seg);
         return limit;
     }
 
     // Parse temp data, and insert entry into hash table
-    private static int parseData(int idx, Work w, int cityx, long n8, long base) {
+    private static long parseData(long idx, Work w, long cityx, long n8, MemorySegment seg) {
         // Reading tempature:
         int temp = 0;
         boolean neg = false;
-        byte b = UNSAFE.getByte(base + idx++);
+        byte b = seg.get(BYTE, idx++);
         if (b == '-') {
             neg = true;
-            b = UNSAFE.getByte(base + idx++);
+            b = seg.get(BYTE, idx++);
         }
         temp = b - '0';
-        b = UNSAFE.getByte(base + idx++);
+        b = seg.get(BYTE, idx++);
         if (b != '.') {
             temp = temp * 10 + b - '0';
             idx++;
         }
         // Read fraction digit; scaled decimal temp
-        b = UNSAFE.getByte(base + idx++);
+        b = seg.get(BYTE, idx++);
         temp = temp * 10 + b - '0';
         if (neg)
             temp = -temp;
@@ -241,12 +236,12 @@ abstract class CalculateAverage_cliffclick {
         // F*KING WINDOWS.
         // Skip CR
         // idx++;
-        w.insert(n8, temp, base, cityx);
+        w.insert(n8, temp, seg, cityx);
         return idx;
     }
 
-    private static int skipFirst(int idx, long base) {
-        while (UNSAFE.getByte(base + idx++) != '\n')
+    private static long skipFirst(long idx, MemorySegment seg) {
+        while (seg.get(BYTE, idx++) != '\n')
             ;
         // WINDOWS
         // idx++;
@@ -267,7 +262,7 @@ abstract class CalculateAverage_cliffclick {
         final byte[] city = new byte[256];
         int reprobes;
 
-        void insert(long n8, int temp, long base, int cityx) {
+        void insert(long n8, int temp, MemorySegment seg, long cityx) {
             // 3 bytes uniquely id city, left at 4
             int uhash = (int) uhash_final(n8);
             // Index in small table
@@ -281,7 +276,7 @@ abstract class CalculateAverage_cliffclick {
                     cnt_key = uhash & 0xFFFFFFFFL;
                     min_max = min_max(0x7FFF, 0xF000, 0);
                     // Put city name in cities
-                    new_city(ihash, base + cityx);
+                    new_city(ihash, seg, cityx);
                     break;
                 }
                 // Reprobe. Seeiong 53M reprobes out of 1000M rows, so a 5.3% reprobe rate
@@ -311,13 +306,14 @@ abstract class CalculateAverage_cliffclick {
         }
 
         // New city
-        void new_city(int ihash, long base_cityx) {
+        void new_city(int ihash, MemorySegment seg, long cityx) {
             // Put city name in cities
             int i = 0;
             byte c;
-            while ((c = UNSAFE.getByte(base_cityx++)) != ';')
+            while ((c = seg.get(BYTE, cityx++)) != ';')
                 city[i++] = c;
-            cities[ihash] = new String(city, 0, 0, i);
+            // Latin-1 decode, same as the old String(byte[], hibyte=0, off, count)
+            cities[ihash] = new String(city, 0, i, StandardCharsets.ISO_8859_1);
         }
 
         private static int hash_hash(int uhash) {
@@ -381,6 +377,7 @@ abstract class CalculateAverage_cliffclick {
                 if (key0 == 0) {
                     key0 = key;
                     min0 = min;
+                    max0 = max; // was missing: an all-negative station reported max 0.0
                     cities[ihash] = w.cities[i];
                 }
                 table[(ihash << 1)] = cnt_key(cnt0, key0);
@@ -406,7 +403,7 @@ abstract class CalculateAverage_cliffclick {
 
         static int temp(long min_max) {
             return (int) min_max;
-        }; // Low int
+        } // Low int
 
         static long cnt_key(int cnt, int key) {
             return ((long) cnt << 32) | (key & 0xFFFFFFFFL);
@@ -440,7 +437,8 @@ abstract class CalculateAverage_cliffclick {
                 double max = max(min_max) / 10.0;
                 double temp = temp(min_max) / 10.0;
                 double mean = temp / cnt;
-                sb.append(String.format("%s=%.1f/%.1f/%.1f, ", city, min, mean, max));
+                // Locale.ROOT: always '.' as the decimal separator
+                sb.append(String.format(Locale.ROOT, "%s=%.1f/%.1f/%.1f, ", city, min, mean, max));
             }
             if (sb.length() > 2)
                 sb.setLength(sb.length() - 2);

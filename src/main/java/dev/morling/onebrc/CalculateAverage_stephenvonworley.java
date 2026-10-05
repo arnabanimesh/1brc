@@ -15,17 +15,22 @@
  */
 package dev.morling.onebrc;
 
-import java.io.*;
-import java.lang.foreign.*;
-import java.lang.reflect.Field;
-import java.nio.*;
-import java.nio.channels.*;
-import java.nio.file.*;
-import java.nio.charset.*;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.stream.*;
-import sun.misc.Unsafe;
+import java.io.IOException;
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 /*
  * Stephen Von Worley's (von@von.io) entry to Gunnar Morling's "One Billion Row Challenge":
@@ -43,9 +48,17 @@ import sun.misc.Unsafe;
  * 4. Aggregates the resulting Tables into a treemap of names to Tallies.
  * 5. Outputs the names and Tallies in ascending name order.
  *
+ * Java 27 port: all memory access now goes through the standard Foreign Function & Memory
+ * API (java.lang.foreign, final since Java 22) instead of sun.misc.Unsafe, whose
+ * memory-access methods are deprecated for removal (JEP 471/498) and throw
+ * UnsupportedOperationException by default as of JDK 26. No restricted methods are used,
+ * so no --enable-native-access or --sun-misc-unsafe-memory-access flags are required.
+ * Where the original passed raw addresses around, this version passes a MemorySegment
+ * plus a long offset into it.
+ *
  * Runs fastest as a natively-compiled, standalone binary, as might be produced by Graal's
- * `native-image` utility.  Tested with Oracle Graal 21.0.2.
- * 
+ * `native-image` utility.
+ *
  * Incorporates code authored by a number of submitters, including Thomas Wue, Quan Anh
  * Mai, and others.
  *
@@ -77,17 +90,11 @@ public class CalculateAverage_stephenvonworley {
     private static final long OFFSET_LEN = 16;
     private static final long OFFSET_NAME = 17;
 
-    private static final Unsafe unsafe;
-    static {
-        try {
-            Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            unsafe = (Unsafe) f.get(null);
-        }
-        catch (Exception e) {
-            throw new RuntimeException("Exception initializing unsafe", e);
-        }
-    }
+    // Native byte order, no alignment requirement (the parser does many unaligned reads).
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfShort SHORT = ValueLayout.JAVA_SHORT_UNALIGNED;
+    private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED;
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
 
     public static void main(String[] args) throws IOException, InterruptedException {
         if (!List.of(args).contains("--worker")) {
@@ -124,31 +131,34 @@ public class CalculateAverage_stephenvonworley {
         return file.map(FileChannel.MapMode.READ_ONLY, 0, file.size(), Arena.global());
     }
 
+    // Zero-initialized, page-aligned.
     private static MemorySegment allocate(long len) {
         return Arena.global().allocate(len, 4096);
     }
 
-    private static Queue<Chunk> partition(MemorySegment in) throws IOException {
+    private static Queue<Chunk> partition(MemorySegment in) {
         Queue<Chunk> chunks = new ConcurrentLinkedDeque<>();
-        long address = in.address();
         long len = in.byteSize();
-        long start = address;
-        while (start < address + len) {
+        long start = 0;
+        while (start < len) {
             long end = start + CHUNK_SIZE;
-            if (end >= address + len) {
-                end = address + len;
+            if (end >= len) {
+                end = len;
             }
             else {
-                end = afterNewline(end);
+                end = afterNewline(in, end);
             }
+            long size = end - start;
             Chunk chunk;
-            if (end + CHUNK_PAD < address + len) {
-                chunk = new Chunk(start, end);
+            if (end + CHUNK_PAD < len) {
+                // The slice includes CHUNK_PAD bytes past the chunk, so the parser's
+                // 8-byte reads at the tail of the chunk stay in bounds.
+                chunk = new Chunk(in.asSlice(start, size + CHUNK_PAD), size);
             }
             else {
-                MemorySegment padded = allocate(end - start + CHUNK_PAD);
-                MemorySegment.copy(in, start - address, padded, 0, end - start);
-                chunk = new Chunk(padded.address(), padded.address() + (end - start));
+                MemorySegment padded = allocate(size + CHUNK_PAD);
+                MemorySegment.copy(in, start, padded, 0, size);
+                chunk = new Chunk(padded, size);
             }
             chunks.offer(chunk);
             start = end;
@@ -165,7 +175,7 @@ public class CalculateAverage_stephenvonworley {
                 tables.add(t);
                 Chunk chunk;
                 while ((chunk = chunks.poll()) != null) {
-                    parse3(chunk.start(), chunk.end(), t);
+                    parse3(chunk.segment(), chunk.length(), t);
                 }
             });
             threads.add(thread);
@@ -187,22 +197,23 @@ public class CalculateAverage_stephenvonworley {
         table.process((name, min, max, total, count) -> nameToTally.computeIfAbsent(name, _ -> new Tally()).add(min, max, total, count));
     }
 
-    private static void parse3(long start, long end, Table table) {
+    // Parses in[0, length), reading at three evenly-spaced locations at once.
+    private static void parse3(MemorySegment in, long length, Table table) {
 
-        if (end - start < CHUNK_PARSE3_LIMIT) {
-            parse1(start, end, table);
+        if (length < CHUNK_PARSE3_LIMIT) {
+            parse1(in, 0, length, table);
             return;
         }
 
-        final long tallies = table.tallies;
+        final MemorySegment tallies = table.tallies;
 
-        long part = (end - start) / 3;
-        long startA = start;
-        long startB = afterNewline(start + part);
-        long startC = afterNewline(start + 2 * part);
+        long part = length / 3;
+        long startA = 0;
+        long startB = afterNewline(in, part);
+        long startC = afterNewline(in, 2 * part);
         long endA = startB;
         long endB = startC;
-        long endC = end;
+        long endC = length;
 
         while (true) {
             long N = min(
@@ -215,42 +226,42 @@ public class CalculateAverage_stephenvonworley {
             }
 
             while (N > 0) {
-                long semicolonA = semicolon(startA);
-                long semicolonB = semicolon(startB);
-                long semicolonC = semicolon(startC);
+                long semicolonA = semicolon(in, startA);
+                long semicolonB = semicolon(in, startB);
+                long semicolonC = semicolon(in, startC);
 
-                long tallyA = locate(startA, semicolonA, tallies, table);
-                long tallyB = locate(startB, semicolonB, tallies, table);
-                long tallyC = locate(startC, semicolonC, tallies, table);
+                long tallyA = locate(in, startA, semicolonA, tallies, table);
+                long tallyB = locate(in, startB, semicolonB, tallies, table);
+                long tallyC = locate(in, startC, semicolonC, tallies, table);
 
-                long numberA = number(semicolonA);
-                tally(tallyA, numberA);
-                long numberB = number(semicolonB);
-                tally(tallyB, numberB);
-                long numberC = number(semicolonC);
-                tally(tallyC, numberC);
+                long numberA = number(in, semicolonA);
+                tally(tallies, tallyA, numberA);
+                long numberB = number(in, semicolonB);
+                tally(tallies, tallyB, numberB);
+                long numberC = number(in, semicolonC);
+                tally(tallies, tallyC, numberC);
 
-                startA = next(semicolonA);
-                startB = next(semicolonB);
-                startC = next(semicolonC);
+                startA = next(in, semicolonA);
+                startB = next(in, semicolonB);
+                startC = next(in, semicolonC);
                 N--;
             }
         }
 
-        parse1(startA, endA, table);
-        parse1(startB, endB, table);
-        parse1(startC, endC, table);
+        parse1(in, startA, endA, table);
+        parse1(in, startB, endB, table);
+        parse1(in, startC, endC, table);
     }
 
-    private static void parse1(long start, long end, Table table) {
-        final long tallies = table.tallies;
+    private static void parse1(MemorySegment in, long start, long end, Table table) {
+        final MemorySegment tallies = table.tallies;
 
         while (start < end) {
-            long semicolon = semicolon(start);
-            long tally = locate(start, semicolon, tallies, table);
-            long number = number(semicolon);
-            tally(tally, number);
-            start = next(semicolon);
+            long semicolon = semicolon(in, start);
+            long tally = locate(in, start, semicolon, tallies, table);
+            long number = number(in, semicolon);
+            tally(tallies, tally, number);
+            start = next(in, semicolon);
         }
     }
 
@@ -259,9 +270,9 @@ public class CalculateAverage_stephenvonworley {
     }
 
     // credit: Adapted from code by Thomas Wue
-    private static long semicolon(long start) {
+    private static long semicolon(MemorySegment in, long start) {
         start++;
-        long word = getLong(start);
+        long word = getLong(in, start);
         long input = word ^ 0x3B3B3B3B3B3B3B3BL;
         long tmp = (input - 0x0101010101010101L) & ~input & 0x8080808080808080L;
         if (tmp != 0) {
@@ -269,7 +280,7 @@ public class CalculateAverage_stephenvonworley {
         }
         while (true) {
             start += 8;
-            long word2 = getLong(start);
+            long word2 = getLong(in, start);
             long input2 = word2 ^ 0x3B3B3B3B3B3B3B3BL;
             long tmp2 = (input2 - 0x0101010101010101L) & ~input2 & 0x8080808080808080L;
             if (tmp2 != 0) {
@@ -283,72 +294,72 @@ public class CalculateAverage_stephenvonworley {
         return ((value << shift) >>> shift);
     }
 
+    // Finds (or creates) the tally slot for the name in[start, semicolon).
+    // Returns the slot's offset within the tallies segment.
     // https://softwareengineering.stackexchange.com/questions/402542/where-do-magic-hashing-constants-like-0x9e3779b9-and-0x9e3779b1-come-from
-    private static long locate(long start, long semicolon, long tallies, Table table) {
+    private static long locate(MemorySegment in, long start, long semicolon, MemorySegment tallies, Table table) {
         long len = semicolon - start;
-        long word = getLong(start);
+        long word = getLong(in, start);
         if (len <= 8) {
             word = trim(word, 8 - len);
             long hash = word * GOLDEN_LONG;
-            long offset = (hash >>> (64 - HASH_BITS)) << TALLY_BITS;
+            long tally = (hash >>> (64 - HASH_BITS)) << TALLY_BITS;
             while (true) {
-                long tally = tallies + offset;
-                long tlen = getByte(tally + OFFSET_LEN);
-                long tword = getLong(tally + OFFSET_NAME);
+                long tlen = getByte(tallies, tally + OFFSET_LEN);
+                long tword = getLong(tallies, tally + OFFSET_NAME);
                 if (len == tlen && word == tword) {
                     return tally;
                 }
                 if (tword == 0) {
-                    init(tally, start, len, table);
+                    init(tallies, tally, in, start, len, table);
                     return tally;
                 }
-                offset = (offset + TALLY_SIZE) & HASH_MASK;
+                tally = (tally + TALLY_SIZE) & HASH_MASK;
             }
         }
         else {
-            long word2 = getLong(semicolon - 8);
+            long word2 = getLong(in, semicolon - 8);
             long hash = (word + word2) * GOLDEN_LONG;
-            long offset = (hash >>> (64 - HASH_BITS)) << TALLY_BITS;
+            long tally = (hash >>> (64 - HASH_BITS)) << TALLY_BITS;
             while (true) {
-                long tally = tallies + offset;
-                long tword = getLong(tally + OFFSET_NAME);
+                long tword = getLong(tallies, tally + OFFSET_NAME);
                 if (len <= 16) {
-                    long tlen = getByte(tally + OFFSET_LEN);
-                    long tword2 = getLong(tally + OFFSET_NAME + len - 8);
+                    long tlen = getByte(tallies, tally + OFFSET_LEN);
+                    long tword2 = getLong(tallies, tally + OFFSET_NAME + len - 8);
                     if (len == tlen && word == tword && word2 == tword2) {
                         return tally;
                     }
                 }
                 else {
-                    if (match(tally, start, len)) {
+                    if (match(tallies, tally, in, start, len)) {
                         return tally;
                     }
                 }
                 if (tword == 0) {
-                    init(tally, start, len, table);
+                    init(tallies, tally, in, start, len, table);
                     return tally;
                 }
-                offset = (offset + TALLY_SIZE) & HASH_MASK;
+                tally = (tally + TALLY_SIZE) & HASH_MASK;
             }
         }
     }
 
-    private static void init(long tally, long start, long len, Table t) {
-        setShort(tally + OFFSET_MIN, Short.MAX_VALUE);
-        setShort(tally + OFFSET_MAX, Short.MIN_VALUE);
-        setByte(tally + OFFSET_LEN, (byte) len);
-        copyMemory(start, tally + OFFSET_NAME, len);
-        t.addresses[t.count++] = tally;
+    private static void init(MemorySegment tallies, long tally, MemorySegment in, long start, long len, Table t) {
+        setShort(tallies, tally + OFFSET_MIN, Short.MAX_VALUE);
+        setShort(tallies, tally + OFFSET_MAX, Short.MIN_VALUE);
+        setByte(tallies, tally + OFFSET_LEN, (byte) len);
+        MemorySegment.copy(in, start, tallies, tally + OFFSET_NAME, len);
+        t.offsets[t.count++] = tally;
     }
 
-    private static boolean match(long tally, long name, long len) {
-        if (getByte(tally + OFFSET_LEN) != len) {
+    private static boolean match(MemorySegment tallies, long tally, MemorySegment in, long name, long len) {
+        if (getByte(tallies, tally + OFFSET_LEN) != len) {
             return false;
         }
         long a = name;
         long b = tally + OFFSET_NAME;
         while (len > 7) {
-            if (getLong(a) != getLong(b)) {
+            if (getLong(in, a) != getLong(tallies, b)) {
                 return false;
             }
             a += 8;
@@ -356,14 +367,14 @@ public class CalculateAverage_stephenvonworley {
             len -= 8;
         }
         if (len > 0) {
-            return (trim(getLong(a), 8 - len) == getLong(b));
+            return (trim(getLong(in, a), 8 - len) == getLong(tallies, b));
         }
         return true;
     }
 
     // credit: Wonderfully-fast number parsing implementation by Quan Anh Mai
-    private static long number(long semicolon) {
-        long numberWord = getLong(semicolon + 1);
+    private static long number(MemorySegment in, long semicolon) {
+        long numberWord = getLong(in, semicolon + 1);
         int decimalSepPos = Long.numberOfTrailingZeros(~numberWord & 0x10101000);
         int shift = 28 - decimalSepPos;
         // signed is -1 if negative, 0 otherwise
@@ -378,31 +389,31 @@ public class CalculateAverage_stephenvonworley {
         return (absValue ^ signed) - signed;
     }
 
-    private static void tally(long tally, long number) {
-        short min = getShort(tally + OFFSET_MIN);
-        short max = getShort(tally + OFFSET_MAX);
-        int count = getInt(tally + OFFSET_COUNT);
-        long total = getLong(tally + OFFSET_TOTAL);
+    private static void tally(MemorySegment tallies, long tally, long number) {
+        short min = getShort(tallies, tally + OFFSET_MIN);
+        short max = getShort(tallies, tally + OFFSET_MAX);
+        int count = getInt(tallies, tally + OFFSET_COUNT);
+        long total = getLong(tallies, tally + OFFSET_TOTAL);
         if (number < min) {
-            setShort(tally + OFFSET_MIN, (short) number);
+            setShort(tallies, tally + OFFSET_MIN, (short) number);
         }
         if (number > max) {
-            setShort(tally + OFFSET_MAX, (short) number);
+            setShort(tallies, tally + OFFSET_MAX, (short) number);
         }
-        setInt(tally + OFFSET_COUNT, count + 1);
-        setLong(tally + OFFSET_TOTAL, total + number);
+        setInt(tallies, tally + OFFSET_COUNT, count + 1);
+        setLong(tallies, tally + OFFSET_TOTAL, total + number);
     }
 
-    private static long next(long semicolon) {
-        long word = getLong(semicolon);
+    private static long next(MemorySegment in, long semicolon) {
+        long word = getLong(in, semicolon);
         semicolon += 7;
         semicolon -= (~word >>> (24 + 4)) & 1;
         semicolon -= (~word >>> (16 + 4 - 1)) & 2;
         return semicolon;
     }
 
-    private static long afterNewline(long start) {
-        while (getByte(start) != '\n')
+    private static long afterNewline(MemorySegment in, long start) {
+        while (getByte(in, start) != '\n')
             start++;
         return start + 1;
     }
@@ -411,76 +422,70 @@ public class CalculateAverage_stephenvonworley {
         return Math.min(a, Math.min(b, c));
     }
 
-    private static byte getByte(long addr) {
-        return unsafe.getByte(addr);
+    private static byte getByte(MemorySegment s, long offset) {
+        return s.get(BYTE, offset);
     }
 
-    private static short getShort(long addr) {
-        return unsafe.getShort(addr);
+    private static short getShort(MemorySegment s, long offset) {
+        return s.get(SHORT, offset);
     }
 
-    private static int getInt(long addr) {
-        return unsafe.getInt(addr);
+    private static int getInt(MemorySegment s, long offset) {
+        return s.get(INT, offset);
     }
 
-    private static long getLong(long addr) {
-        return unsafe.getLong(addr);
+    private static long getLong(MemorySegment s, long offset) {
+        return s.get(LONG, offset);
     }
 
-    private static void setByte(long addr, byte value) {
-        unsafe.putByte(addr, value);
+    private static void setByte(MemorySegment s, long offset, byte value) {
+        s.set(BYTE, offset, value);
     }
 
-    private static void setShort(long addr, short value) {
-        unsafe.putShort(addr, value);
+    private static void setShort(MemorySegment s, long offset, short value) {
+        s.set(SHORT, offset, value);
     }
 
-    private static void setInt(long addr, int value) {
-        unsafe.putInt(addr, value);
+    private static void setInt(MemorySegment s, long offset, int value) {
+        s.set(INT, offset, value);
     }
 
-    private static void setLong(long addr, long value) {
-        unsafe.putLong(addr, value);
+    private static void setLong(MemorySegment s, long offset, long value) {
+        s.set(LONG, offset, value);
     }
 
-    private static void copyMemory(long srcAddr, long dstAddr, long count) {
-        unsafe.copyMemory(srcAddr, dstAddr, count);
-    }
-
-    private static record Chunk(long start, long end) {
+    // segment covers the chunk plus CHUNK_PAD trailing bytes; length is the chunk's logical size.
+    private record Chunk(MemorySegment segment, long length) {
     }
 
     private static class Table {
-        public final long tallies;
-        public final long[] addresses;
+        public final MemorySegment tallies;
+        public final long[] offsets;
         public int count;
 
         public Table() {
-            tallies = allocate(TABLE_SIZE).address();
-            addresses = new long[NAME_LIMIT];
+            tallies = allocate(TABLE_SIZE);
+            offsets = new long[NAME_LIMIT];
             count = 0;
         }
 
         public void process(Consumer consumer) {
             for (int i = 0; i < count; i++) {
-                long address = addresses[i];
-                int len = getByte(address + OFFSET_LEN);
-                byte[] bytes = new byte[len];
-                for (int j = 0; j < len; j++) {
-                    bytes[j] = getByte(address + OFFSET_NAME + j);
-                }
+                long tally = offsets[i];
+                int len = getByte(tallies, tally + OFFSET_LEN);
+                byte[] bytes = tallies.asSlice(tally + OFFSET_NAME, len).toArray(BYTE);
                 String name = new String(bytes, StandardCharsets.UTF_8);
-                long min = getShort(address + OFFSET_MIN);
-                long max = getShort(address + OFFSET_MAX);
-                long total = getLong(address + OFFSET_TOTAL);
-                long count = getInt(address + OFFSET_COUNT);
+                long min = getShort(tallies, tally + OFFSET_MIN);
+                long max = getShort(tallies, tally + OFFSET_MAX);
+                long total = getLong(tallies, tally + OFFSET_TOTAL);
+                long count = getInt(tallies, tally + OFFSET_COUNT);
                 consumer.consume(name, min, max, total, count);
             }
         }
     }
 
-    private static interface Consumer {
-        public void consume(String name, long min, long max, long total, long count);
+    private interface Consumer {
+        void consume(String name, long min, long max, long total, long count);
     }
 
     private static class Tally {

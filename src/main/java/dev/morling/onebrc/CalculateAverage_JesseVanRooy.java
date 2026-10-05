@@ -15,13 +15,10 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.lang.reflect.Field;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -35,20 +32,8 @@ public class CalculateAverage_JesseVanRooy {
 
     private static final ValueLayout.OfByte DATA_LAYOUT = ValueLayout.JAVA_BYTE;
 
-    private static final Unsafe UNSAFE = initUnsafe();
-
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
     public static class Result {
+        // offset of the name inside the chunk's MemorySegment (only meaningful until name is resolved)
         long nameStart;
         long nameSize;
         String name;
@@ -90,15 +75,13 @@ public class CalculateAverage_JesseVanRooy {
         for (int i = 0; i < VALUE_CAPACITY; i++)
             preCreatedResults[i] = new Result();
 
-        // load address info
-        final long size = memorySegment.byteSize();
-        final long address = memorySegment.address();
-        final long end = address + size;
+        // all positions below are offsets relative to the start of this chunk
+        final long end = memorySegment.byteSize();
 
-        for (long index = address; index < end;) {
+        for (long index = 0; index < end;) {
             final long nameStart = index;
 
-            byte next = UNSAFE.getByte(index);
+            byte next = memorySegment.get(DATA_LAYOUT, index);
 
             // hash the city name
             int hash = 0;
@@ -106,26 +89,26 @@ public class CalculateAverage_JesseVanRooy {
                 hash = (hash * 33) + next;
 
                 index++;
-                next = UNSAFE.getByte(index);
+                next = memorySegment.get(DATA_LAYOUT, index);
             }
 
             final long nameEnd = index;
 
             // skip the separator
             index++;
-            next = UNSAFE.getByte(index);
+            next = memorySegment.get(DATA_LAYOUT, index);
 
             // check for negative
             boolean negative = next == '-';
             if (negative) {
                 index++;
-                next = UNSAFE.getByte(index);
+                next = memorySegment.get(DATA_LAYOUT, index);
             }
 
             // count the temperature
             int temperature = next - '0';
             index++;
-            next = UNSAFE.getByte(index);
+            next = memorySegment.get(DATA_LAYOUT, index);
 
             if (next != '.') {
                 temperature = (temperature * 10) + (next - '0');
@@ -134,7 +117,7 @@ public class CalculateAverage_JesseVanRooy {
 
             // skip the .
             index++;
-            next = UNSAFE.getByte(index);
+            next = memorySegment.get(DATA_LAYOUT, index);
 
             // add the last digit to temperature
             temperature = (temperature * 10) + (next - '0');
@@ -178,7 +161,7 @@ public class CalculateAverage_JesseVanRooy {
         threadResult.results = Arrays.stream(values).filter(Objects::nonNull).toArray(Result[]::new);
 
         for (Result result : threadResult.results) {
-            result.name = new String(memorySegment.asSlice(result.nameStart - address, result.nameSize).toArray(DATA_LAYOUT));
+            result.name = new String(memorySegment.asSlice(result.nameStart, result.nameSize).toArray(DATA_LAYOUT));
         }
     }
 

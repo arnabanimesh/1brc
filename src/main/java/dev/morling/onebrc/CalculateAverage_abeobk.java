@@ -18,7 +18,8 @@ package dev.morling.onebrc;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
 import java.nio.charset.StandardCharsets;
@@ -31,18 +32,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.IntStream;
 
-import sun.misc.Unsafe;
-
 public class CalculateAverage_abeobk {
     private static final int CPU_CNT = Runtime.getRuntime().availableProcessors();
 
     private static final String FILE = "./measurements.txt";
     private static final int BUCKET_SIZE = 1 << 16;
     private static final long BUCKET_MASK = BUCKET_SIZE - 1;
-    private static final int MAX_STR_LEN = 100;
     private static final int MAX_STATIONS = 10000;
     private static final long CHUNK_SZ = 1 << 22;
-    private static final Unsafe UNSAFE = initUnsafe();
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
     private static final long[] HASH_MASKS = new long[]{
             0x0L,
             0xffL,
@@ -59,15 +57,23 @@ public class CalculateAverage_abeobk {
     private static int chunk_cnt;
     private static long start_addr, end_addr;
 
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (Exception ex) {
-            throw new RuntimeException();
-        }
+    /*
+     * Replacement for sun.misc.Unsafe (memory-access methods are being removed, JEP 471/498).
+     *
+     * A segment spanning the whole address space, so an absolute address can be used directly
+     * as the offset, exactly like Unsafe.getLong(address). MemorySegment::reinterpret is a
+     * restricted method, so the worker process must run with --enable-native-access=ALL-UNNAMED
+     * (spawnWorker() adds it).
+     *
+     * It lives in a holder class so that only the worker process initializes it; the parent
+     * process never calls a restricted method.
+     */
+    private static final class Mem {
+        static final MemorySegment SEG = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
+    }
+
+    static final long getLong(final long addr) {
+        return Mem.SEG.get(LONG, addr);
     }
 
     /*
@@ -136,11 +142,11 @@ public class CalculateAverage_abeobk {
 
     // Find next line address
     static final long nextLF(long addr) {
-        long word = UNSAFE.getLong(addr);
+        long word = getLong(addr);
         long lfpos_code = getLFCode(word);
         while (lfpos_code == 0) {
             addr += 8;
-            word = UNSAFE.getLong(addr);
+            word = getLong(addr);
             lfpos_code = getLFCode(word);
         }
         return addr + (Long.numberOfTrailingZeros(lfpos_code) >>> 3) + 1;
@@ -168,10 +174,15 @@ public class CalculateAverage_abeobk {
         ProcessHandle.Info info = ProcessHandle.current().info();
         ArrayList<String> workerCommand = new ArrayList<>();
         info.command().ifPresent(workerCommand::add);
+        // the worker calls MemorySegment::reinterpret (restricted method), so enable native
+        // access for it; this must come before the original JVM options / main class
+        workerCommand.add("--enable-native-access=ALL-UNNAMED");
         info.arguments().ifPresent(args -> workerCommand.addAll(Arrays.asList(args)));
         workerCommand.add("--worker");
         new ProcessBuilder()
                 .command(workerCommand)
+                // show worker errors/warnings instead of silently dropping them
+                .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start()
                 .getInputStream()
                 .transferTo(System.out);
@@ -193,9 +204,9 @@ public class CalculateAverage_abeobk {
         }
 
         final String key() {
-            byte[] sbuf = new byte[MAX_STR_LEN];
-            UNSAFE.copyMemory(null, addr, sbuf, Unsafe.ARRAY_BYTE_BASE_OFFSET, keylen);
-            return new String(sbuf, 0, (int) keylen, StandardCharsets.UTF_8);
+            byte[] sbuf = new byte[keylen];
+            MemorySegment.copy(Mem.SEG, ValueLayout.JAVA_BYTE, addr, sbuf, 0, keylen);
+            return new String(sbuf, StandardCharsets.UTF_8);
         }
 
         Node(long a, long h, int kl, long v) {
@@ -259,7 +270,7 @@ public class CalculateAverage_abeobk {
             long xsum = 0;
             long n = kl & 0xF8;
             for (long i = 8; i < n; i += 8) {
-                xsum |= (UNSAFE.getLong(addr + i) ^ UNSAFE.getLong(other_addr + i));
+                xsum |= (getLong(addr + i) ^ getLong(other_addr + i));
             }
             return xsum == 0;
         }
@@ -269,7 +280,7 @@ public class CalculateAverage_abeobk {
                 return false;
             long n = keylen & 0xF8;
             for (long i = 0; i < n; i += 8) {
-                if (UNSAFE.getLong(addr + i) != UNSAFE.getLong(other.addr + i))
+                if (getLong(addr + i) != getLong(other.addr + i))
                     return false;
             }
             return true;
@@ -395,7 +406,7 @@ public class CalculateAverage_abeobk {
         }
 
         final long word() {
-            return UNSAFE.getLong(addr);
+            return getLong(addr);
         }
 
         final void skip(int n) {
@@ -445,7 +456,7 @@ public class CalculateAverage_abeobk {
             }
 
             skip(8);
-            long word = UNSAFE.getLong(addr);
+            long word = getLong(addr);
             semipos_code = getSemiCode(word);
             // 43% chance
             if (semipos_code != 0) {
@@ -471,7 +482,7 @@ public class CalculateAverage_abeobk {
             while (semipos_code == 0) {
                 hash ^= word;
                 skip(8);
-                word = UNSAFE.getLong(addr);
+                word = getLong(addr);
                 semipos_code = getSemiCode(word);
             }
 

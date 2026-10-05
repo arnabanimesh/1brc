@@ -15,48 +15,46 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 
+/**
+ * Same algorithm as the original, but memory is accessed through the java.lang.foreign API
+ * (final since Java 22) instead of sun.misc.Unsafe, whose memory-access methods are being removed.
+ * Raw addresses became offsets into the mapped file's MemorySegment.
+ */
 public class CalculateAverage_zerninv {
     private static final String FILE = "./measurements.txt";
     private static final int CORES = Runtime.getRuntime().availableProcessors();
     private static final int CHUNK_SIZE = 1024 * 1024 * 32;
 
-    private static final Unsafe UNSAFE = initUnsafe();
-
-    private static Unsafe initUnsafe() {
-        try {
-            Field unsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            unsafe.setAccessible(true);
-            return (Unsafe) unsafe.get(Unsafe.class);
-        }
-        catch (IllegalAccessException | NoSuchFieldException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    // Accessors for the mapped file. The word-at-a-time parsing below assumes little-endian byte order,
+    // so it is requested explicitly (this costs nothing on little-endian CPUs).
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     public static void main(String[] args) throws IOException, InterruptedException {
         try (var channel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
             var fileSize = channel.size();
             var minChunkSize = Math.min(fileSize, CHUNK_SIZE);
-            var segment = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
+            var data = channel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
 
             var tasks = new TaskThread[CORES];
             for (int i = 0; i < tasks.length; i++) {
-                tasks[i] = new TaskThread((int) (fileSize / minChunkSize / CORES + 1));
+                tasks[i] = new TaskThread(data, (int) (fileSize / minChunkSize / CORES + 1));
             }
 
-            var chunks = splitByChunks(segment.address(), segment.address() + fileSize, minChunkSize);
+            var chunks = splitByChunks(data, fileSize, minChunkSize);
             for (int i = 0; i < chunks.size() - 1; i++) {
                 var task = tasks[i % tasks.length];
                 task.addChunk(chunks.get(i), chunks.get(i + 1));
@@ -79,15 +77,16 @@ public class CalculateAverage_zerninv {
         }
     }
 
-    private static List<Long> splitByChunks(long address, long end, long minChunkSize) {
-        // split by chunks
-        List<Long> result = new ArrayList<>((int) ((end - address) / minChunkSize + 1));
-        result.add(address);
-        while (address < end) {
-            address += Math.min(end - address, minChunkSize);
-            while (address < end && UNSAFE.getByte(address++) != '\n') {
+    private static List<Long> splitByChunks(MemorySegment data, long end, long minChunkSize) {
+        // split by chunks, offsets are relative to the start of the mapped file
+        List<Long> result = new ArrayList<>((int) (end / minChunkSize + 1));
+        long offset = 0;
+        result.add(offset);
+        while (offset < end) {
+            offset += Math.min(end - offset, minChunkSize);
+            while (offset < end && data.get(BYTE, offset++) != '\n') {
             }
-            result.add(address);
+            result.add(offset);
         }
         return result;
     }
@@ -131,66 +130,74 @@ public class CalculateAverage_zerninv {
         private static final int MIN_OFFSET = 33;
         private static final int MAX_OFFSET = 35;
 
-        private final long address;
+        // Entries are packed (37 bytes), so the table is accessed with unaligned layouts
+        private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED;
+        private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
+        private static final ValueLayout.OfShort SHORT = ValueLayout.JAVA_SHORT_UNALIGNED;
 
-        private MeasurementContainer() {
-            address = UNSAFE.allocateMemory(ENTRY_SIZE * SIZE);
-            UNSAFE.setMemory(address, ENTRY_SIZE * SIZE, (byte) 0);
+        // the mapped input file, entries refer to station names in it by offset
+        private final MemorySegment data;
+        private final MemorySegment table;
+
+        private MeasurementContainer(MemorySegment data) {
+            this.data = data;
+            // allocate() returns zeroed memory, and a zero count marks a free slot
+            this.table = Arena.ofAuto().allocate((long) ENTRY_SIZE * SIZE, Long.BYTES);
         }
 
         public void put(long address, byte size, int hash, long lastBytes, short value) {
             int idx = Math.abs(hash % SIZE);
-            long ptr = this.address + idx * ENTRY_SIZE;
+            long ptr = (long) idx * ENTRY_SIZE;
             int count;
             boolean fastEqual;
 
-            while ((count = UNSAFE.getInt(ptr + COUNT_OFFSET)) != 0) {
-                fastEqual = UNSAFE.getInt(ptr + HASH_OFFSET) == hash && UNSAFE.getLong(ptr + LAST_BYTES_OFFSET) == lastBytes;
-                if (fastEqual && UNSAFE.getByte(ptr + SIZE_OFFSET) == size && isEqual(UNSAFE.getLong(ptr + ADDRESS_OFFSET), address, size - 8)) {
+            while ((count = table.get(INT, ptr + COUNT_OFFSET)) != 0) {
+                fastEqual = table.get(INT, ptr + HASH_OFFSET) == hash && table.get(LONG, ptr + LAST_BYTES_OFFSET) == lastBytes;
+                if (fastEqual && table.get(BYTE, ptr + SIZE_OFFSET) == size && isEqual(table.get(LONG, ptr + ADDRESS_OFFSET), address, size - 8)) {
 
-                    UNSAFE.putInt(ptr + COUNT_OFFSET, count + 1);
-                    UNSAFE.putLong(ptr + ADDRESS_OFFSET, address);
-                    UNSAFE.putLong(ptr + SUM_OFFSET, UNSAFE.getLong(ptr + SUM_OFFSET) + value);
-                    if (value < UNSAFE.getShort(ptr + MIN_OFFSET)) {
-                        UNSAFE.putShort(ptr + MIN_OFFSET, value);
+                    table.set(INT, ptr + COUNT_OFFSET, count + 1);
+                    table.set(LONG, ptr + ADDRESS_OFFSET, address);
+                    table.set(LONG, ptr + SUM_OFFSET, table.get(LONG, ptr + SUM_OFFSET) + value);
+                    if (value < table.get(SHORT, ptr + MIN_OFFSET)) {
+                        table.set(SHORT, ptr + MIN_OFFSET, value);
                     }
-                    if (value > UNSAFE.getShort(ptr + MAX_OFFSET)) {
-                        UNSAFE.putShort(ptr + MAX_OFFSET, value);
+                    if (value > table.get(SHORT, ptr + MAX_OFFSET)) {
+                        table.set(SHORT, ptr + MAX_OFFSET, value);
                     }
                     return;
                 }
                 idx = (idx + 1) % SIZE;
-                ptr = this.address + idx * ENTRY_SIZE;
+                ptr = (long) idx * ENTRY_SIZE;
             }
 
-            UNSAFE.putInt(ptr + COUNT_OFFSET, 1);
-            UNSAFE.putInt(ptr + HASH_OFFSET, hash);
-            UNSAFE.putLong(ptr + LAST_BYTES_OFFSET, lastBytes);
-            UNSAFE.putByte(ptr + SIZE_OFFSET, size);
-            UNSAFE.putLong(ptr + ADDRESS_OFFSET, address);
+            table.set(INT, ptr + COUNT_OFFSET, 1);
+            table.set(INT, ptr + HASH_OFFSET, hash);
+            table.set(LONG, ptr + LAST_BYTES_OFFSET, lastBytes);
+            table.set(BYTE, ptr + SIZE_OFFSET, size);
+            table.set(LONG, ptr + ADDRESS_OFFSET, address);
 
-            UNSAFE.putLong(ptr + SUM_OFFSET, value);
-            UNSAFE.putShort(ptr + MIN_OFFSET, value);
-            UNSAFE.putShort(ptr + MAX_OFFSET, value);
+            table.set(LONG, ptr + SUM_OFFSET, value);
+            table.set(SHORT, ptr + MIN_OFFSET, value);
+            table.set(SHORT, ptr + MAX_OFFSET, value);
         }
 
         public void collectTo(Map<String, TemperatureAggregation> results) {
             int count;
             for (int i = 0; i < SIZE; i++) {
-                long ptr = this.address + i * ENTRY_SIZE;
-                count = UNSAFE.getInt(ptr + COUNT_OFFSET);
+                long ptr = (long) i * ENTRY_SIZE;
+                count = table.get(INT, ptr + COUNT_OFFSET);
                 if (count != 0) {
-                    var station = createString(UNSAFE.getLong(ptr + ADDRESS_OFFSET), UNSAFE.getByte(ptr + SIZE_OFFSET));
+                    var station = createString(table.get(LONG, ptr + ADDRESS_OFFSET), table.get(BYTE, ptr + SIZE_OFFSET));
                     var result = results.get(station);
                     if (result == null) {
                         results.put(station, new TemperatureAggregation(
-                                UNSAFE.getLong(ptr + SUM_OFFSET),
+                                table.get(LONG, ptr + SUM_OFFSET),
                                 count,
-                                UNSAFE.getShort(ptr + MIN_OFFSET),
-                                UNSAFE.getShort(ptr + MAX_OFFSET)));
+                                table.get(SHORT, ptr + MIN_OFFSET),
+                                table.get(SHORT, ptr + MAX_OFFSET)));
                     }
                     else {
-                        result.merge(UNSAFE.getLong(ptr + SUM_OFFSET), count, UNSAFE.getShort(ptr + MIN_OFFSET), UNSAFE.getShort(ptr + MAX_OFFSET));
+                        result.merge(table.get(LONG, ptr + SUM_OFFSET), count, table.get(SHORT, ptr + MIN_OFFSET), table.get(SHORT, ptr + MAX_OFFSET));
                     }
                 }
             }
@@ -198,7 +205,7 @@ public class CalculateAverage_zerninv {
 
         private boolean isEqual(long address, long address2, int size) {
             for (int i = 0; i < size; i += 8) {
-                if (UNSAFE.getLong(address + i) != UNSAFE.getLong(address2 + i)) {
+                if (data.get(LONG_LE, address + i) != data.get(LONG_LE, address2 + i)) {
                     return false;
                 }
             }
@@ -206,11 +213,7 @@ public class CalculateAverage_zerninv {
         }
 
         private String createString(long address, byte size) {
-            byte[] arr = new byte[size];
-            for (int i = 0; i < size; i++) {
-                arr[i] = UNSAFE.getByte(address + i);
-            }
-            return new String(arr);
+            return new String(data.asSlice(address, size).toArray(BYTE), StandardCharsets.UTF_8);
         }
     }
 
@@ -237,12 +240,14 @@ public class CalculateAverage_zerninv {
                 0xffffffffffffffffL
         };
 
+        private final MemorySegment data;
         private final MeasurementContainer container;
         private final List<Long> begins;
         private final List<Long> ends;
 
-        private TaskThread(int chunks) {
-            this.container = new MeasurementContainer();
+        private TaskThread(MemorySegment data, int chunks) {
+            this.data = data;
+            this.container = new MeasurementContainer(data);
             this.begins = new ArrayList<>(chunks);
             this.ends = new ArrayList<>(chunks);
         }
@@ -257,7 +262,7 @@ public class CalculateAverage_zerninv {
             for (int i = 0; i < begins.size(); i++) {
                 var begin = begins.get(i);
                 var end = ends.get(i) - 1;
-                while (end > begin && UNSAFE.getByte(end - 1) != '\n') {
+                while (end > begin && data.get(BYTE, end - 1) != '\n') {
                     end--;
                 }
                 calcForChunk(begin, end);
@@ -272,35 +277,31 @@ public class CalculateAverage_zerninv {
             byte cityNameSize = 0;
 
             byte b;
-            while ((b = UNSAFE.getByte(offset++)) != ';') {
+            while ((b = data.get(BYTE, offset++)) != ';') {
                 lastBytes = (lastBytes << 8) | b;
                 hashCode = hashCode * 31 + b;
                 cityNameSize++;
             }
 
-            int temperature;
-            int word = UNSAFE.getInt(offset);
-            offset += 4;
-
-            if ((word & TWO_NEGATIVE_DIGITS_MASK) == TWO_NEGATIVE_DIGITS_MASK) {
-                word >>>= 8;
-                temperature = ZERO * 11 - ((word & BYTE_MASK) * 10 + ((word >>> 16) & BYTE_MASK));
+            // The last line of a chunk can be the last line of the file, so the temperature is parsed
+            // byte by byte: the word-sized reads of calcForChunk could run past the end of the mapping,
+            // which a MemorySegment rejects (Unsafe silently read the zero padding of the last page).
+            long fileSize = data.byteSize();
+            boolean negative = false;
+            int temperature = 0;
+            while (offset < fileSize && (b = data.get(BYTE, offset++)) != '\n') {
+                if (b == '-') {
+                    negative = true;
+                }
+                else if (b >= '0' && b <= '9') {
+                    temperature = temperature * 10 + (b - ZERO);
+                }
             }
-            else if ((word & THREE_DIGITS_MASK) == THREE_DIGITS_MASK) {
-                temperature = (word & BYTE_MASK) * 100 + ((word >>> 8) & BYTE_MASK) * 10 + ((word >>> 24) & BYTE_MASK) - ZERO * 111;
-            }
-            else if ((word & TWO_DIGITS_MASK) == TWO_DIGITS_MASK) {
-                temperature = (word & BYTE_MASK) * 10 + ((word >>> 16) & BYTE_MASK) - ZERO * 11;
-            }
-            else {
-                // #.##-
-                word = (word >>> 8) | (UNSAFE.getByte(offset) << 24);
-                temperature = ZERO * 111 - ((word & BYTE_MASK) * 100 + ((word >>> 8) & BYTE_MASK) * 10 + ((word >>> 24) & BYTE_MASK));
-            }
-            container.put(cityOffset, cityNameSize, hashCode, lastBytes, (short) temperature);
+            container.put(cityOffset, cityNameSize, hashCode, lastBytes, (short) (negative ? -temperature : temperature));
         }
 
         private void calcForChunk(long offset, long end) {
+            final MemorySegment data = this.data;
             long cityOffset, lastBytes, city, masked, hashCode;
             int temperature, word, delimiterIdx;
             byte cityNameSize;
@@ -312,7 +313,7 @@ public class CalculateAverage_zerninv {
                 delimiterIdx = 8;
 
                 while (delimiterIdx == 8) {
-                    city = UNSAFE.getLong(offset);
+                    city = data.get(LONG_LE, offset);
                     masked = city ^ DELIMITER_MASK;
                     masked = (masked - 0x0101010101010101L) & ~masked & 0x8080808080808080L;
                     delimiterIdx = Long.numberOfTrailingZeros(masked) >>> 3;
@@ -326,7 +327,7 @@ public class CalculateAverage_zerninv {
 
                 cityNameSize = (byte) (offset - cityOffset);
 
-                word = UNSAFE.getInt(++offset);
+                word = data.get(INT_LE, ++offset);
                 offset += 4;
 
                 if ((word & TWO_NEGATIVE_DIGITS_MASK) == TWO_NEGATIVE_DIGITS_MASK) {
@@ -342,7 +343,7 @@ public class CalculateAverage_zerninv {
                 }
                 else {
                     // #.##-
-                    word = (word >>> 8) | (UNSAFE.getByte(offset++) << 24);
+                    word = (word >>> 8) | (data.get(BYTE, offset++) << 24);
                     temperature = ZERO * 111 - ((word & BYTE_MASK) * 100 + ((word >>> 8) & BYTE_MASK) * 10 + ((word >>> 24) & BYTE_MASK));
                 }
                 offset++;

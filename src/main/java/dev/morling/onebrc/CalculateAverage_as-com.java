@@ -15,8 +15,11 @@
  */
 package dev.morling.onebrc;
 
-import jdk.incubator.vector.*;
-import sun.misc.Unsafe;
+import jdk.incubator.vector.VectorSpecies;
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.VectorMask;
+import jdk.incubator.vector.IntVector;
+import jdk.incubator.vector.VectorOperators;
 
 import java.io.File;
 import java.io.IOException;
@@ -25,9 +28,9 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
-import java.lang.reflect.Field;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -40,6 +43,16 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 // based on spullara's submission
+//
+// JDK 27 notes:
+// - sun.misc.Unsafe is no longer used. Its memory-access methods were deprecated for removal
+// (JEP 471) and now throw by default, so the unaligned 8-byte read goes through the FFM API.
+// - FFM is a standard API (since JDK 22): do not pass --enable-preview.
+// - The Vector API is still incubating (JEP 537): --add-modules jdk.incubator.vector is required
+// both at compile time and at run time.
+//
+// javac --release 27 --add-modules jdk.incubator.vector -d target/classes CalculateAverage_asun.java
+// java --add-modules jdk.incubator.vector -cp target/classes dev.morling.onebrc.CalculateAverage_asun [file]
 
 class CalculateAverage_asun {
     private static final String FILE = "./measurements.txt";
@@ -47,6 +60,10 @@ class CalculateAverage_asun {
     private static final VectorSpecies<Byte> BYTE_SPECIES = ByteVector.SPECIES_256;
     private static final VectorSpecies<Integer> INT_SPECIES = IntVector.SPECIES_256;
     private static final int VECTOR_SIZE = 32;
+
+    // Replacement for Unsafe.getLong(address): unaligned, explicitly little-endian
+    // (the number parsing below relies on little-endian byte order).
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     private static final ByteVector ASC;
     static {
@@ -56,19 +73,6 @@ class CalculateAverage_asun {
         }
 
         ASC = ByteVector.fromArray(BYTE_SPECIES, bytes, 0);
-    }
-
-    private static final Unsafe UNSAFE;
-
-    static {
-        try {
-            Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            UNSAFE = (Unsafe) f.get(null);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
     }
 
     private static AtomicLongArray segmentQueue;
@@ -114,7 +118,6 @@ class CalculateAverage_asun {
         public void run() {
             var resultMap = new ByteArrayToResultMap();
             var ms = this.ms.asSlice(0);
-            var msAddr = ms.address();
             var actualLimit = ms.byteSize();
             var buffer = new byte[100 + VECTOR_SIZE];
 
@@ -172,8 +175,8 @@ class CalculateAverage_asun {
                         break;
                     }
 
-                    long g = UNSAFE.getLong(msAddr + currentPosition);
-                    // long g = ms.get(ValueLayout.JAVA_LONG_UNALIGNED, currentPosition);
+                    // Bounds are guaranteed: currentPosition < longLimit <= actualLimit - 8
+                    long g = ms.get(LONG_LE, currentPosition);
                     boolean minus = (g & 0xff) == '-';
                     long minusL = (minus ? 1L : 0L) - 1;
                     int negative = minus ? -1 : 1;
@@ -259,7 +262,14 @@ class CalculateAverage_asun {
 
                 while (head >= tail) {
                     if ((boolean) doneHandle.getAcquire()) {
-                        return false;
+                        // tail is published before doneQueueing, so re-read it: a stale tail
+                        // here would otherwise make us skip the last segment(s)
+                        head = (int) headHandle.getAcquire();
+                        tail = (int) tailHandle.getAcquire();
+                        if (head >= tail) {
+                            return false;
+                        }
+                        break;
                     }
 
                     head = (int) headHandle.getAcquire();
@@ -321,7 +331,7 @@ class CalculateAverage_asun {
             // System.out.println(i + " " + (System.currentTimeMillis() - start));
 
             for (Entry e : result.getAll()) {
-                resultsMap.merge(new String(e.key()), e.value(), CalculateAverage_asun::merge);
+                resultsMap.merge(new String(e.key(), StandardCharsets.UTF_8), e.value(), CalculateAverage_asun::merge);
             }
 
             // System.out.println(i + " " + (System.currentTimeMillis() - start));

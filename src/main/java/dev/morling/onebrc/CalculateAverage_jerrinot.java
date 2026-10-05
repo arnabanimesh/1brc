@@ -15,13 +15,12 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.channels.FileChannel.MapMode;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
@@ -48,9 +47,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * <li>Francesco Nigro (franz1981): For our online discussions about performance. Both before and during this challenge.
  *     Francesco gave me the idea to check register spilling.</li>
  * </ul>
+ * <p>
+ * <b>JDK 26+ port</b>
+ * <p>
+ * sun.misc.Unsafe memory access throws UnsupportedOperationException by default since JDK 26 (JEP 498 / JEP 471)
+ * and the methods are going away entirely. All raw memory access now goes through {@link Raw}, which is backed by
+ * the Foreign Function &amp; Memory API (JEP 454, final since JDK 22). The algorithm itself is unchanged.
+ * <p>
+ * {@link Raw} needs one <i>restricted</i> FFM call, so the worker JVM is launched with
+ * {@code --enable-native-access=ALL-UNNAMED} (see {@link #spawnWorker()}). If you run with {@code --worker} directly,
+ * pass that flag yourself (or add {@code Enable-Native-Access: ALL-UNNAMED} to the jar manifest).
  */
 public class CalculateAverage_jerrinot {
-    private static final Unsafe UNSAFE = unsafe();
     private static final String MEASUREMENTS_TXT = "measurements.txt";
     // todo: with hyper-threading enable we would be better of with availableProcessors / 2;
     // todo: validate the testing env. params.
@@ -86,14 +94,46 @@ public class CalculateAverage_jerrinot {
             0xffffffffffffffffL,
     };
 
-    private static Unsafe unsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
+    /**
+     * Raw absolute-address memory access, a drop-in replacement for the handful of sun.misc.Unsafe methods this
+     * solution used. Backed by a single zero-based segment spanning the whole address space, so plain
+     * {@code long} addresses (file mapping, off-heap tables) keep working exactly as before.
+     * <p>
+     * All layouts are the <i>_UNALIGNED</i> variants: the hash-table entries contain 8-byte fields at 4-byte
+     * offsets (e.g. {@code sum} at +12), and the parser reads 8-byte words at arbitrary byte positions. The
+     * aligned layouts would throw on those.
+     */
+    private static final class Raw {
+        private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
+        private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED;
+        private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+
+        // MemorySegment::reinterpret is a restricted method: needs --enable-native-access=ALL-UNNAMED.
+        @SuppressWarnings("restricted")
+        private static final MemorySegment ALL = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
+
+        static long getLong(long address) {
+            return ALL.get(LONG, address);
         }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
+
+        static int getInt(long address) {
+            return ALL.get(INT, address);
+        }
+
+        static byte getByte(long address) {
+            return ALL.get(BYTE, address);
+        }
+
+        static void putLong(long address, long value) {
+            ALL.set(LONG, address, value);
+        }
+
+        static void putInt(long address, int value) {
+            ALL.set(INT, address, value);
+        }
+
+        static void copyMemory(long srcAddress, long dstAddress, long bytes) {
+            MemorySegment.copy(ALL, srcAddress, ALL, dstAddress, bytes);
         }
     }
 
@@ -110,6 +150,9 @@ public class CalculateAverage_jerrinot {
         ProcessHandle.Info info = ProcessHandle.current().info();
         ArrayList<String> workerCommand = new ArrayList<>();
         info.command().ifPresent(workerCommand::add);
+        // JVM options must precede the main class / -jar, so this goes right after the java executable.
+        // Needed by Raw (MemorySegment::reinterpret) to avoid a warning today and a failure in a future JDK.
+        workerCommand.add("--enable-native-access=ALL-UNNAMED");
         info.arguments().ifPresent(args -> workerCommand.addAll(Arrays.asList(args)));
         workerCommand.add("--worker");
         new ProcessBuilder()
@@ -241,16 +284,16 @@ public class CalculateAverage_jerrinot {
         // credit: merykitty
         private long parseAndStoreTemperature(long startCursor, long baseEntryPtr, long word) {
             long countPtr = baseEntryPtr + MAP_COUNT_OFFSET;
-            int cnt = UNSAFE.getInt(countPtr);
-            UNSAFE.putInt(countPtr, cnt + 1);
+            int cnt = Raw.getInt(countPtr);
+            Raw.putInt(countPtr, cnt + 1);
 
             long minPtr = baseEntryPtr + MAP_MIN_OFFSET;
             long maxPtr = baseEntryPtr + MAP_MAX_OFFSET;
             long sumPtr = baseEntryPtr + MAP_SUM_OFFSET;
 
-            int min = UNSAFE.getInt(minPtr);
-            int max = UNSAFE.getInt(maxPtr);
-            long sum = UNSAFE.getLong(sumPtr);
+            int min = Raw.getInt(minPtr);
+            int max = Raw.getInt(maxPtr);
+            long sum = Raw.getLong(sumPtr);
 
             final long negateda = ~word;
             final int dotPos = Long.numberOfTrailingZeros(negateda & 0x10101000);
@@ -260,13 +303,13 @@ public class CalculateAverage_jerrinot {
             final long absValue = ((digits * 0x640a0001) >>> 32) & 0x3FF;
             final int temperature = (int) ((absValue ^ signed) - signed);
             sum += temperature;
-            UNSAFE.putLong(sumPtr, sum);
+            Raw.putLong(sumPtr, sum);
 
             if (temperature > max) {
-                UNSAFE.putInt(maxPtr, temperature);
+                Raw.putInt(maxPtr, temperature);
             }
             if (temperature < min) {
-                UNSAFE.putInt(minPtr, temperature);
+                Raw.putInt(minPtr, temperature);
             }
             return startCursor + (dotPos / 8) + 3;
         }
@@ -300,39 +343,39 @@ public class CalculateAverage_jerrinot {
 
         private void transferToHeap(long fastMap) {
             for (long baseAddress = slowMap; baseAddress < slowMap + SLOW_MAP_SIZE_BYTES; baseAddress += SLOW_MAP_ENTRY_SIZE_BYTES) {
-                long len = UNSAFE.getInt(baseAddress + MAP_LEN_OFFSET);
+                long len = Raw.getInt(baseAddress + MAP_LEN_OFFSET);
                 if (len == 0) {
                     continue;
                 }
                 byte[] nameArr = new byte[(int) len];
-                long baseNameAddr = UNSAFE.getLong(baseAddress + SLOW_MAP_NAME_OFFSET);
+                long baseNameAddr = Raw.getLong(baseAddress + SLOW_MAP_NAME_OFFSET);
                 for (int i = 0; i < len; i++) {
-                    nameArr[i] = UNSAFE.getByte(baseNameAddr + i);
+                    nameArr[i] = Raw.getByte(baseNameAddr + i);
                 }
                 String name = new String(nameArr);
-                int min = UNSAFE.getInt(baseAddress + MAP_MIN_OFFSET);
-                int max = UNSAFE.getInt(baseAddress + MAP_MAX_OFFSET);
-                int count = UNSAFE.getInt(baseAddress + MAP_COUNT_OFFSET);
-                long sum = UNSAFE.getLong(baseAddress + MAP_SUM_OFFSET);
+                int min = Raw.getInt(baseAddress + MAP_MIN_OFFSET);
+                int max = Raw.getInt(baseAddress + MAP_MAX_OFFSET);
+                int count = Raw.getInt(baseAddress + MAP_COUNT_OFFSET);
+                long sum = Raw.getLong(baseAddress + MAP_SUM_OFFSET);
 
                 stats.put(name, new CalculateAverage_jerrinot.StationStats(min, max, count, sum));
             }
 
             for (long baseAddress = fastMap; baseAddress < fastMap + FAST_MAP_SIZE_BYTES; baseAddress += FAST_MAP_ENTRY_SIZE_BYTES) {
-                long len = UNSAFE.getInt(baseAddress + MAP_LEN_OFFSET);
+                long len = Raw.getInt(baseAddress + MAP_LEN_OFFSET);
                 if (len == 0) {
                     continue;
                 }
                 byte[] nameArr = new byte[(int) len];
                 long baseNameAddr = baseAddress + FAST_MAP_NAME_PART1;
                 for (int i = 0; i < len; i++) {
-                    nameArr[i] = UNSAFE.getByte(baseNameAddr + i);
+                    nameArr[i] = Raw.getByte(baseNameAddr + i);
                 }
                 String name = new String(nameArr);
-                int min = UNSAFE.getInt(baseAddress + MAP_MIN_OFFSET);
-                int max = UNSAFE.getInt(baseAddress + MAP_MAX_OFFSET);
-                int count = UNSAFE.getInt(baseAddress + MAP_COUNT_OFFSET);
-                long sum = UNSAFE.getLong(baseAddress + MAP_SUM_OFFSET);
+                int min = Raw.getInt(baseAddress + MAP_MIN_OFFSET);
+                int max = Raw.getInt(baseAddress + MAP_MAX_OFFSET);
+                int count = Raw.getInt(baseAddress + MAP_COUNT_OFFSET);
+                long sum = Raw.getLong(baseAddress + MAP_SUM_OFFSET);
 
                 var v = stats.get(name);
                 if (v == null) {
@@ -352,7 +395,7 @@ public class CalculateAverage_jerrinot {
                 // but when processing just one thing then it's better to keep things local as much as possible? maybe:)
 
                 long start = cursor;
-                long currentWord = UNSAFE.getLong(cursor);
+                long currentWord = Raw.getLong(cursor);
                 long mask = getDelimiterMask(currentWord);
                 long firstWordMask = ((mask - 1) ^ mask) >>> 8;
                 final long isMaskZeroA = ((mask | -mask) >>> 63) ^ 1;
@@ -364,7 +407,7 @@ public class CalculateAverage_jerrinot {
                 int mapIndex = hash & MAP_MASK;
                 while (mask == 0) {
                     cursor += 8;
-                    currentWord = UNSAFE.getLong(cursor);
+                    currentWord = Raw.getLong(cursor);
                     mask = getDelimiterMask(currentWord);
                 }
                 final int delimiterByte = Long.numberOfTrailingZeros(mask);
@@ -374,12 +417,12 @@ public class CalculateAverage_jerrinot {
                 int len = (int) (semicolon - start);
                 if (len > 15) {
                     long baseEntryPtr = getOrCreateEntryBaseOffsetSlow(len, start, hash, maskedWord);
-                    long temperatureWord = UNSAFE.getLong(semicolon + 1);
+                    long temperatureWord = Raw.getLong(semicolon + 1);
                     cursor = parseAndStoreTemperature(semicolon + 1, baseEntryPtr, temperatureWord);
                 }
                 else {
                     long baseEntryPtr = getOrCreateEntryBaseOffsetFast(mapIndex, len, maskedWord, maskedFirstWord, fastMap);
-                    long temperatureWord = UNSAFE.getLong(semicolon + 1);
+                    long temperatureWord = Raw.getLong(semicolon + 1);
                     cursor = parseAndStoreTemperature(semicolon + 1, baseEntryPtr, temperatureWord);
                 }
             }
@@ -399,7 +442,7 @@ public class CalculateAverage_jerrinot {
         private static long nextNewLine(long prev) {
             // again: credits to @thomaswue for this code, literally copy'n'paste
             while (true) {
-                long currentWord = UNSAFE.getLong(prev);
+                long currentWord = Raw.getLong(prev);
                 long input = currentWord ^ NEW_LINE_PATTERN;
                 long pos = (input - 0x0101010101010101L) & ~input & 0x8080808080808080L;
                 if (pos != 0) {
@@ -415,40 +458,43 @@ public class CalculateAverage_jerrinot {
 
         @Override
         public void run() {
-            long fastMap = allocateMem();
-            for (;;) {
-                long startingPtr = globalCursor.addAndGet(SEGMENT_SIZE) - SEGMENT_SIZE;
-                if (startingPtr >= fileEnd) {
-                    break;
+            // The tables are off-heap memory owned by a per-thread confined arena. It is released once the results
+            // have been moved to the heap (previously this was Unsafe::allocateMemory and was never freed).
+            try (Arena arena = Arena.ofConfined()) {
+                long fastMap = allocateMem(arena);
+                for (;;) {
+                    long startingPtr = globalCursor.addAndGet(SEGMENT_SIZE) - SEGMENT_SIZE;
+                    if (startingPtr >= fileEnd) {
+                        break;
+                    }
+                    setCursors(startingPtr);
+                    mainLoop(fastMap);
+                    doOne(cursorA, endA, fastMap);
+                    doOne(cursorB, endB, fastMap);
                 }
-                setCursors(startingPtr);
-                mainLoop(fastMap);
-                doOne(cursorA, endA, fastMap);
-                doOne(cursorB, endB, fastMap);
+                transferToHeap(fastMap);
             }
-            transferToHeap(fastMap);
         }
 
-        private long allocateMem() {
-            this.slowMap = UNSAFE.allocateMemory(SLOW_MAP_SIZE_BYTES);
-            this.slowMapNamesPtr = UNSAFE.allocateMemory(SLOW_MAP_MAP_NAMES_BYTES);
-            long fastMap = UNSAFE.allocateMemory(FAST_MAP_SIZE_BYTES);
-            UNSAFE.setMemory(slowMap, SLOW_MAP_SIZE_BYTES, (byte) 0);
-            UNSAFE.setMemory(fastMap, FAST_MAP_SIZE_BYTES, (byte) 0);
-            UNSAFE.setMemory(slowMapNamesPtr, SLOW_MAP_MAP_NAMES_BYTES, (byte) 0);
-            return fastMap;
+        private long allocateMem(Arena arena) {
+            // Arena::allocate returns zero-initialized memory, which replaces the explicit Unsafe::setMemory calls.
+            // The zeroing is relied upon: an empty slot is detected by len == 0, and the slow-map names area must
+            // have zero padding after each name so that the masked last-word comparison works.
+            this.slowMap = arena.allocate(SLOW_MAP_SIZE_BYTES, 64).address();
+            this.slowMapNamesPtr = arena.allocate(SLOW_MAP_MAP_NAMES_BYTES, 8).address();
+            return arena.allocate(FAST_MAP_SIZE_BYTES, 64).address();
         }
 
         private void mainLoop(long fastMap) {
             while (cursorA < endA && cursorB < endB) {
-                long currentWordA = UNSAFE.getLong(cursorA);
-                long currentWordB = UNSAFE.getLong(cursorB);
+                long currentWordA = Raw.getLong(cursorA);
+                long currentWordB = Raw.getLong(cursorB);
 
                 long delimiterMaskA = getDelimiterMask(currentWordA);
                 long delimiterMaskB = getDelimiterMask(currentWordB);
 
-                long candidateWordA = UNSAFE.getLong(cursorA + 8);
-                long candidateWordB = UNSAFE.getLong(cursorB + 8);
+                long candidateWordA = Raw.getLong(cursorA + 8);
+                long candidateWordB = Raw.getLong(cursorB + 8);
 
                 long startA = cursorA;
                 long startB = cursorB;
@@ -506,8 +552,8 @@ public class CalculateAverage_jerrinot {
                     long lastWordMaskA = HASH_MASKS[trailingZerosA];
                     long lastWordMaskB = HASH_MASKS[trailingZerosB];
 
-                    long temperatureWordA = UNSAFE.getLong(digitStartA);
-                    long temperatureWordB = UNSAFE.getLong(digitStartB);
+                    long temperatureWordA = Raw.getLong(digitStartA);
+                    long temperatureWordB = Raw.getLong(digitStartB);
 
                     final long maskedLastWordA = currentWordA & lastWordMaskA;
                     final long maskedLastWordB = currentWordB & lastWordMaskB;
@@ -536,13 +582,13 @@ public class CalculateAverage_jerrinot {
             int trailingZerosA;
             while (delimiterMaskA == 0) {
                 cursorA += 8;
-                currentWordA = UNSAFE.getLong(cursorA);
+                currentWordA = Raw.getLong(cursorA);
                 delimiterMaskA = getDelimiterMask(currentWordA);
             }
 
             while (delimiterMaskB == 0) {
                 cursorB += 8;
-                currentWordB = UNSAFE.getLong(cursorB);
+                currentWordB = Raw.getLong(cursorB);
                 delimiterMaskB = getDelimiterMask(currentWordB);
             }
             trailingZerosA = Long.numberOfTrailingZeros(delimiterMaskA) >> 3;
@@ -557,8 +603,8 @@ public class CalculateAverage_jerrinot {
             long lastWordMaskA = HASH_MASKS[trailingZerosA];
             long lastWordMaskB = HASH_MASKS[trailingZerosB];
 
-            long temperatureWordA = UNSAFE.getLong(digitStartA);
-            long temperatureWordB = UNSAFE.getLong(digitStartB);
+            long temperatureWordA = Raw.getLong(digitStartA);
+            long temperatureWordB = Raw.getLong(digitStartB);
 
             final long maskedLastWordA = currentWordA & lastWordMaskA;
             final long maskedLastWordB = currentWordB & lastWordMaskB;
@@ -614,13 +660,13 @@ public class CalculateAverage_jerrinot {
         private static long getOrCreateEntryBaseOffsetFast(int mapIndexA, int lenA, long maskedLastWord, long maskedFirstWord, long fastMap) {
             for (;;) {
                 long basePtr = mapIndexA * FAST_MAP_ENTRY_SIZE_BYTES + fastMap;
-                long namePart1 = UNSAFE.getLong(basePtr + FAST_MAP_NAME_PART1);
-                long namePart2 = UNSAFE.getLong(basePtr + FAST_MAP_NAME_PART2);
+                long namePart1 = Raw.getLong(basePtr + FAST_MAP_NAME_PART1);
+                long namePart2 = Raw.getLong(basePtr + FAST_MAP_NAME_PART2);
                 if (namePart1 == maskedFirstWord && namePart2 == maskedLastWord) {
                     return basePtr;
                 }
                 long lenPtr = basePtr + MAP_LEN_OFFSET;
-                int len = UNSAFE.getInt(lenPtr);
+                int len = Raw.getInt(lenPtr);
                 if (len == 0) {
                     return newEntryFast(lenA, maskedLastWord, maskedFirstWord, lenPtr, basePtr);
                 }
@@ -629,12 +675,12 @@ public class CalculateAverage_jerrinot {
         }
 
         private static long newEntryFast(int lenA, long maskedLastWord, long maskedFirstWord, long lenPtr, long basePtr) {
-            UNSAFE.putInt(lenPtr, lenA);
+            Raw.putInt(lenPtr, lenA);
             // todo: this could be a single putLong()
-            UNSAFE.putInt(basePtr + MAP_MAX_OFFSET, Integer.MIN_VALUE);
-            UNSAFE.putInt(basePtr + MAP_MIN_OFFSET, Integer.MAX_VALUE);
-            UNSAFE.putLong(basePtr + FAST_MAP_NAME_PART1, maskedFirstWord);
-            UNSAFE.putLong(basePtr + FAST_MAP_NAME_PART2, maskedLastWord);
+            Raw.putInt(basePtr + MAP_MAX_OFFSET, Integer.MIN_VALUE);
+            Raw.putInt(basePtr + MAP_MIN_OFFSET, Integer.MAX_VALUE);
+            Raw.putLong(basePtr + FAST_MAP_NAME_PART1, maskedFirstWord);
+            Raw.putLong(basePtr + FAST_MAP_NAME_PART2, maskedLastWord);
             return basePtr;
         }
 
@@ -645,19 +691,19 @@ public class CalculateAverage_jerrinot {
                 long basePtr = mapIndexA * SLOW_MAP_ENTRY_SIZE_BYTES + slowMap;
                 long lenPtr = basePtr + MAP_LEN_OFFSET;
                 long namePtr = basePtr + SLOW_MAP_NAME_OFFSET;
-                int len = UNSAFE.getInt(lenPtr);
+                int len = Raw.getInt(lenPtr);
                 if (len == lenA) {
-                    namePtr = UNSAFE.getLong(basePtr + SLOW_MAP_NAME_OFFSET);
+                    namePtr = Raw.getLong(basePtr + SLOW_MAP_NAME_OFFSET);
                     if (nameMatchSlow(startPtr, namePtr, fullLen, maskedLastWord)) {
                         return basePtr;
                     }
                 }
                 else if (len == 0) {
-                    UNSAFE.putLong(namePtr, slowMapNamesPtr);
-                    UNSAFE.putInt(lenPtr, lenA);
-                    UNSAFE.putInt(basePtr + MAP_MAX_OFFSET, Integer.MIN_VALUE);
-                    UNSAFE.putInt(basePtr + MAP_MIN_OFFSET, Integer.MAX_VALUE);
-                    UNSAFE.copyMemory(startPtr, slowMapNamesPtr, lenA);
+                    Raw.putLong(namePtr, slowMapNamesPtr);
+                    Raw.putInt(lenPtr, lenA);
+                    Raw.putInt(basePtr + MAP_MAX_OFFSET, Integer.MIN_VALUE);
+                    Raw.putInt(basePtr + MAP_MIN_OFFSET, Integer.MAX_VALUE);
+                    Raw.copyMemory(startPtr, slowMapNamesPtr, lenA);
                     long alignedLen = (lenA & ~7L) + 8;
                     slowMapNamesPtr += alignedLen;
                     return basePtr;
@@ -669,11 +715,11 @@ public class CalculateAverage_jerrinot {
         private static boolean nameMatchSlow(long start, long namePtr, long fullLen, long maskedLastWord) {
             long offset;
             for (offset = 0; offset < fullLen; offset += 8) {
-                if (UNSAFE.getLong(start + offset) != UNSAFE.getLong(namePtr + offset)) {
+                if (Raw.getLong(start + offset) != Raw.getLong(namePtr + offset)) {
                     return false;
                 }
             }
-            long maskedWordInMap = UNSAFE.getLong(namePtr + fullLen);
+            long maskedWordInMap = Raw.getLong(namePtr + fullLen);
             return (maskedWordInMap == maskedLastWord);
         }
     }

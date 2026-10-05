@@ -15,12 +15,11 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
@@ -28,6 +27,20 @@ import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.TreeMap;
 
+/**
+ * Port of the original sun.misc.Unsafe implementation to the Foreign Function & Memory API
+ * (java.lang.foreign, final since JDK 22).
+ * <p>
+ * The memory-access methods of sun.misc.Unsafe throw UnsupportedOperationException by default
+ * from JDK 26 onwards, so the original does not run on JDK 27. This version uses only
+ * non-restricted FFM methods, so no --enable-native-access flag is needed.
+ * <p>
+ * Differences from the original:
+ * - raw addresses (long) are replaced by MemorySegments plus byte offsets
+ * - all multi-byte reads/writes use an explicit little-endian layout, since the parsing
+ * logic assumes the first byte of an int is its low-order byte
+ * - accesses are bounds-checked
+ */
 public class CalculateAverage_ebarlas {
 
     private static final Arena ARENA = Arena.global();
@@ -37,18 +50,9 @@ public class CalculateAverage_ebarlas {
     private static final int MAX_LINE_SIZE = MAX_KEY_SIZE + MAX_VAL_SIZE + 2; // key, semicolon, val, newline
     private static final int HASH_TBL_SIZE = 131_071; // range of allowed hash values, inclusive
 
-    private static final Unsafe UNSAFE = makeUnsafe();
-
-    private static Unsafe makeUnsafe() {
-        try {
-            var f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            return (Unsafe) f.get(null);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+    private static final ValueLayout.OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     public static void main(String[] args) throws IOException, InterruptedException {
         var path = Paths.get("measurements.txt");
@@ -88,14 +92,14 @@ public class CalculateAverage_ebarlas {
         var result = new TreeMap<String, String>();
         for (var st : stats) {
             if (st != null) {
-                var key = new String(convert(st.keyAddr, st.keyLen, st.lastBytes), StandardCharsets.UTF_8);
+                var key = new String(convert(st.key, st.keyLen, st.lastBytes), StandardCharsets.UTF_8);
                 result.put(key, format(st));
             }
         }
         System.out.println(result);
     }
 
-    private static byte[] convert(long keyAddr, int keyLen, int keyLastBytes) {
+    private static byte[] convert(MemorySegment key, int keyLen, int keyLastBytes) {
         var len = keyLastBytes == 4
                 ? keyLen * 4 // fully packed
                 : (keyLen - 1) * 4 + keyLastBytes; // last int partially packed
@@ -103,7 +107,7 @@ public class CalculateAverage_ebarlas {
         var idx = 0;
         for (long i = 0; i < keyLen; i++) {
             var offset = i << 2;
-            var n = UNSAFE.getInt(keyAddr + offset);
+            var n = key.get(INT_LE, offset);
             var bound = i == keyLen - 1 ? keyLastBytes : 4;
             for (int j = 0; j < bound; j++) {
                 bytes[idx++] = (byte) (n & 0xFF);
@@ -127,7 +131,7 @@ public class CalculateAverage_ebarlas {
             var current = partitions.get(i).stats;
             for (int j = 0; j < current.length; j++) {
                 if (current[j] != null) {
-                    var t = findInTable(target, current[j].hash, current[j].keyAddr, current[j].keyLen, current[j].lastBytes);
+                    var t = findInTable(target, current[j].hash, current[j].key, current[j].keyLen, current[j].lastBytes);
                     t.min = Math.min(t.min, current[j].min);
                     t.max = Math.max(t.max, current[j].max);
                     t.sum += current[j].sum;
@@ -176,21 +180,21 @@ public class CalculateAverage_ebarlas {
     }
 
     private static long doProcessSegment(MemorySegment ms, long offset, Stats[] stats, boolean complete) {
-        long cursor = ms.address() + offset;
-        long keyBaseAddr = UNSAFE.allocateMemory(MAX_KEY_SIZE); // reusable target for current key data
+        long cursor = offset; // byte offset into segment
+        MemorySegment keyBuf = ARENA.allocate(MAX_KEY_SIZE, 8); // reusable target for current key data
         long lineStart = cursor; // start of key in segment used for footer calc
-        long limit = ms.address() + (complete ? ms.byteSize() : ms.byteSize() - MAX_LINE_SIZE); // stop short of longest line, sweep up at the end
+        long limit = complete ? ms.byteSize() : ms.byteSize() - MAX_LINE_SIZE; // stop short of longest line, sweep up at the end
         while (cursor < limit) { // one line per iteration
             int keyHash = 0; // key hash code
-            long keyAddr = keyBaseAddr; // address for next int
+            long keyOff = 0; // offset in keyBuf for next int
             int keyArrLen = 0; // number of key 4-byte ints
             int keyLastBytes; // occupancy in last byte (1, 2, 3, or 4)
             int val;
             while (true) {
-                int n = UNSAFE.getInt(cursor);
+                int n = ms.get(INT_LE, cursor);
                 cursor += 4;
                 if ((n & 0xFF) == ';') { // ;vvv
-                    UNSAFE.putInt(keyAddr, 0); // always pad with extra int to facilitate 8-byte aligned comparisons
+                    keyBuf.set(INT_LE, keyOff, 0); // always pad with extra int to facilitate 8-byte aligned comparisons
                     keyLastBytes = 4;
                     byte b0 = (byte) ((n >> 8) & 0xFF);
                     byte b1 = (byte) ((n >> 16) & 0xFF);
@@ -198,19 +202,19 @@ public class CalculateAverage_ebarlas {
                     if (b0 == '-') {
                         if (b2 != '.') { // 6 bytes: -dd.dn
                             cursor++; // decimal point
-                            byte b4 = UNSAFE.getByte(cursor);
+                            byte b4 = ms.get(BYTE, cursor);
                             cursor += 2; // adv beyond digit and newline
                             val = -(((b1 - '0') * 10 + (b2 - '0')) * 10 + (b4 - '0'));
                         }
                         else { // 5 bytes: -d.dn
-                            byte b3 = UNSAFE.getByte(cursor);
+                            byte b3 = ms.get(BYTE, cursor);
                             cursor += 2; // digit and newline
                             val = -((b1 - '0') * 10 + (b3 - '0'));
                         }
                     }
                     else {
                         if (b1 != '.') { // 5 bytes: dd.dn
-                            var b3 = UNSAFE.getByte(cursor);
+                            var b3 = ms.get(BYTE, cursor);
                             cursor += 2; // digit and newline
                             val = ((b0 - '0') * 10 + (b1 - '0')) * 10 + (b3 - '0');
                         }
@@ -223,29 +227,29 @@ public class CalculateAverage_ebarlas {
                 }
                 else if ((n & 0xFF00) == 0x3b00) { // k;vv
                     int k = n & 0xFF;
-                    UNSAFE.putLong(keyAddr, k); // pad with extra int for comparison alignment
+                    keyBuf.set(LONG_LE, keyOff, k); // pad with extra int for comparison alignment
                     keyLastBytes = 1;
                     keyArrLen++;
                     keyHash += k;
                     byte b0 = (byte) ((n >> 16) & 0xFF);
                     byte b1 = (byte) ((n >> 24) & 0xFF);
-                    byte b2 = UNSAFE.getByte(cursor++);
+                    byte b2 = ms.get(BYTE, cursor++);
                     if (b0 == '-') {
                         if (b2 != '.') { // 6 bytes: -dd.dn
                             cursor++; // decimal point
-                            byte b4 = UNSAFE.getByte(cursor);
+                            byte b4 = ms.get(BYTE, cursor);
                             cursor += 2; // adv beyond digit and newline
                             val = -(((b1 - '0') * 10 + (b2 - '0')) * 10 + (b4 - '0'));
                         }
                         else { // 5 bytes: -d.dn
-                            byte b3 = UNSAFE.getByte(cursor);
-                            cursor += 2; // digit newline
+                            byte b3 = ms.get(BYTE, cursor);
+                            cursor += 2; // digit and newline
                             val = -((b1 - '0') * 10 + (b3 - '0'));
                         }
                     }
                     else {
                         if (b1 != '.') { // 5 bytes: dd.dn
-                            byte b3 = UNSAFE.getByte(cursor);
+                            byte b3 = ms.get(BYTE, cursor);
                             cursor += 2; // newline
                             val = ((b0 - '0') * 10 + (b1 - '0')) * 10 + (b3 - '0');
                         }
@@ -258,13 +262,13 @@ public class CalculateAverage_ebarlas {
                 }
                 else if ((n & 0xFF0000) == 0x3b0000) { // kk;v
                     int k = n & 0xFFFF;
-                    UNSAFE.putLong(keyAddr, k); // pad with extra int for comparison alignment
+                    keyBuf.set(LONG_LE, keyOff, k); // pad with extra int for comparison alignment
                     keyLastBytes = 2;
                     keyArrLen++;
                     keyHash += k;
                     byte b0 = (byte) ((n >> 24) & 0xFF);
                     if (b0 == '-') {
-                        n = UNSAFE.getInt(cursor);
+                        n = ms.get(INT_LE, cursor);
                         cursor += 4;
                         byte b1 = (byte) (n & 0xFF);
                         byte b2 = (byte) ((n >> 8) & 0xFF);
@@ -279,9 +283,9 @@ public class CalculateAverage_ebarlas {
                         }
                     }
                     else {
-                        byte b1 = UNSAFE.getByte(cursor++);
-                        byte b2 = UNSAFE.getByte(cursor++);
-                        byte b3 = UNSAFE.getByte(cursor++);
+                        byte b1 = ms.get(BYTE, cursor++);
+                        byte b2 = ms.get(BYTE, cursor++);
+                        byte b3 = ms.get(BYTE, cursor++);
                         if (b1 != '.') { // 5 bytes: dd.dn
                             cursor++; // newline
                             val = ((b0 - '0') * 10 + (b1 - '0')) * 10 + (b3 - '0');
@@ -294,11 +298,11 @@ public class CalculateAverage_ebarlas {
                 }
                 else if ((n & 0xFF000000) == 0x3b000000) { // kkk;
                     int k = n & 0xFFFFFF;
-                    UNSAFE.putLong(keyAddr, k); // pad with extra int for comparison alignment
+                    keyBuf.set(LONG_LE, keyOff, k); // pad with extra int for comparison alignment
                     keyLastBytes = 3;
                     keyArrLen++;
                     keyHash += k;
-                    n = UNSAFE.getInt(cursor);
+                    n = ms.get(INT_LE, cursor);
                     cursor += 4;
                     byte b0 = (byte) (n & 0xFF);
                     byte b1 = (byte) ((n >> 8) & 0xFF);
@@ -306,7 +310,7 @@ public class CalculateAverage_ebarlas {
                     byte b3 = (byte) ((n >> 24) & 0xFF);
                     if (b0 == '-') {
                         if (b2 != '.') { // 6 bytes: -dd.dn
-                            byte b4 = UNSAFE.getByte(cursor);
+                            byte b4 = ms.get(BYTE, cursor);
                             cursor += 2; // adv beyond digit and newline
                             val = -(((b1 - '0') * 10 + (b2 - '0')) * 10 + (b4 - '0'));
                         }
@@ -327,9 +331,9 @@ public class CalculateAverage_ebarlas {
                     break;
                 }
                 else { // kkkk
-                    UNSAFE.putInt(keyAddr, n);
+                    keyBuf.set(INT_LE, keyOff, n);
                     keyArrLen++;
-                    keyAddr += 4;
+                    keyOff += 4;
                     keyHash += n;
                 }
             }
@@ -337,10 +341,10 @@ public class CalculateAverage_ebarlas {
             var idx = keyHash & HASH_TBL_SIZE;
             var st = stats[idx];
             if (st == null) { // nothing in table, eagerly claim spot
-                st = stats[idx] = newStats(keyBaseAddr, keyArrLen, keyLastBytes, keyHash);
+                st = stats[idx] = newStats(keyBuf, keyArrLen, keyLastBytes, keyHash);
             }
-            else if (!equals(st.keyAddr, st.keyLen, keyBaseAddr, keyArrLen)) {
-                st = findInTable(stats, keyHash, keyBaseAddr, keyArrLen, keyLastBytes);
+            else if (!equals(st.key, st.keyLen, keyBuf, keyArrLen)) {
+                st = findInTable(stats, keyHash, keyBuf, keyArrLen, keyLastBytes);
             }
             st.min = Math.min(st.min, val);
             st.max = Math.max(st.max, val);
@@ -348,45 +352,45 @@ public class CalculateAverage_ebarlas {
             st.count++;
             lineStart = cursor; // preserve line start
         }
-        return lineStart - ms.address();
+        return lineStart;
     }
 
-    private static boolean equals(long key1, int len1, long key2, int len2) {
+    private static boolean equals(MemorySegment key1, int len1, MemorySegment key2, int len2) {
         if (len1 != len2) {
             return false;
         }
         if (len1 <= 2) {
-            return UNSAFE.getLong(key1) == UNSAFE.getLong(key2);
+            return key1.get(LONG_LE, 0) == key2.get(LONG_LE, 0);
         }
         if (len1 <= 4) {
-            return UNSAFE.getLong(key1) == UNSAFE.getLong(key2) && UNSAFE.getLong(key1 + 8) == UNSAFE.getLong(key2 + 8);
+            return key1.get(LONG_LE, 0) == key2.get(LONG_LE, 0) && key1.get(LONG_LE, 8) == key2.get(LONG_LE, 8);
         }
         for (int i = 0; i < len1; i += 2) {
-            var offset = i << 2;
-            if (UNSAFE.getLong(key1 + offset) != UNSAFE.getLong(key2 + offset)) {
+            var offset = (long) i << 2;
+            if (key1.get(LONG_LE, offset) != key2.get(LONG_LE, offset)) {
                 return false;
             }
         }
         return true;
     }
 
-    private static Stats findInTable(Stats[] stats, int hash, long keyAddr, int keyLen, int keyLastBytes) { // open-addressing scan
+    private static Stats findInTable(Stats[] stats, int hash, MemorySegment key, int keyLen, int keyLastBytes) { // open-addressing scan
         var idx = hash & HASH_TBL_SIZE;
         var st = stats[idx];
-        while (st != null && !equals(st.keyAddr, st.keyLen, keyAddr, keyLen)) {
+        while (st != null && !equals(st.key, st.keyLen, key, keyLen)) {
             idx = (idx + 1) % (HASH_TBL_SIZE + 1);
             st = stats[idx];
         }
         if (st != null) {
             return st;
         }
-        return stats[idx] = newStats(keyAddr, keyLen, keyLastBytes, hash);
+        return stats[idx] = newStats(key, keyLen, keyLastBytes, hash);
     }
 
-    private static Stats newStats(long keyAddr, int keyLen, int keyLastBytes, int hash) {
-        var bytes = (keyLen + 1) << 2; // include overflow chunk
-        long k = UNSAFE.allocateMemory(bytes);
-        UNSAFE.copyMemory(keyAddr, k, bytes);
+    private static Stats newStats(MemorySegment key, int keyLen, int keyLastBytes, int hash) {
+        var copyBytes = (long) (keyLen + 1) << 2; // include overflow chunk
+        var k = ARENA.allocate(Math.max(copyBytes, 8), 8); // at least 8 bytes: equals() compares in 8-byte steps; zero-initialized
+        MemorySegment.copy(key, 0, k, 0, copyBytes);
         return new Stats(k, keyLen, keyLastBytes, hash);
     }
 
@@ -425,8 +429,8 @@ public class CalculateAverage_ebarlas {
     }
 
     private static class Stats { // min, max, and sum values are modeled with integral types that represent tenths of a unit
-        final long keyAddr; // address of 4-byte integer array
-        final int keyLen; // number of 4-byte integers starting at address
+        final MemorySegment key; // native segment holding the key as a 4-byte integer array plus one zero pad int
+        final int keyLen; // number of 4-byte integers in key
         final int lastBytes; // number of bytes packed into last key int (1, 2, 3 or 4)
         final int hash;
         int min = Integer.MAX_VALUE;
@@ -434,8 +438,8 @@ public class CalculateAverage_ebarlas {
         long sum;
         long count;
 
-        Stats(long keyAddr, int keyLen, int lastBytes, int hash) {
-            this.keyAddr = keyAddr;
+        Stats(MemorySegment key, int keyLen, int lastBytes, int hash) {
+            this.key = key;
             this.keyLen = keyLen;
             this.lastBytes = lastBytes;
             this.hash = hash;

@@ -337,24 +337,6 @@ public class CheaperCharBuffer implements CharSequence {
      * @param startMarker the start string to find, must not be null
      * @param endMarker the end string to find, must not be null
      * @return this instance
-     *
-     * @deprecated Use the new method {@link #trimToContent(String, String)} instead.
-     */
-    public CheaperCharBuffer reduceToContent(final String startMarker, final String endMarker) {
-        return trimToContent(startMarker, endMarker);
-    }
-
-    /**
-     * Reduces the buffer to the content between start and end marker when
-     * only whitespaces are found before the startMarker as well as after the end marker.
-     * If both strings overlap due to identical characters such as "foo" and "oof"
-     * and the buffer is " foof ", we don't do anything.
-     *
-     * <p>If a marker is empty, it behaves like {@link java.lang.String#trim()} on that side.
-     *
-     * @param startMarker the start string to find, must not be null
-     * @param endMarker the end string to find, must not be null
-     * @return this instance
      */
     public CheaperCharBuffer trimToContent(final String startMarker, final String endMarker) {
         // if both are longer or same length than content, don't do anything
@@ -473,18 +455,6 @@ public class CheaperCharBuffer implements CharSequence {
         this.length_ = newLength;
 
         return this;
-    }
-
-    /**
-     * Removes all whitespace at the end.
-     * If all are whitespace, we get an empty buffer
-     *
-     * @return this instance
-     *
-     * @deprecated Use {@link #trimTrailing()} instead.
-     */
-    public CheaperCharBuffer trimWhitespaceAtEnd() {
-        return trimTrailing();
     }
 
     /**

@@ -15,27 +15,67 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
-import java.util.stream.IntStream;
+import java.util.concurrent.Future;
 
+/**
+ * Requires Java 22+ (java.lang.foreign is final from 22 on). Uses no sun.misc.Unsafe,
+ * no restricted methods and no JVM flags.
+ */
 public class CalculateAverage_Smoofie {
 
     private static final String FILE = "./measurements.txt";
-    private static final Unsafe unsafe = getUnsafe();
 
-    private static class MeasurementAggregator {
-        private int min = -1000;
-        private int max = 1000;
+    private static final int HASH_BITS = 16;
+    private static final int MAX_STATIONS = 10_000;
+    private static final int BINS = 1000; // 0.0 .. 99.9 in tenths, one half for >= 0 and one for negatives
+
+    // The last bytes of the file are parsed on a bounds-safe slow path so the 8-byte word reads
+    // in the hot loop can never run past the end of the mapping.
+    private static final int TAIL_MARGIN = 256;
+
+    private static final long HASH_MULTIPLIER = 0x9E3779B97F4A7C15L;
+
+    // The SWAR tricks below assume little-endian word layout; being explicit keeps them correct on any CPU.
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+
+    private static final class MeasurementAggregator {
+        private int min = Integer.MAX_VALUE;
+        private int max = Integer.MIN_VALUE;
         private long sum = 0;
-        private int count = 0;
+        private long count = 0;
+
+        private void add(int value, long times) {
+            if (times > 0) {
+                min = Math.min(min, value);
+                max = Math.max(max, value);
+                sum += value * times;
+                count += times;
+            }
+        }
+
+        private void merge(MeasurementAggregator other) {
+            min = Math.min(min, other.min);
+            max = Math.max(max, other.max);
+            sum += other.sum;
+            count += other.count;
+        }
 
         @Override
         public String toString() {
@@ -47,409 +87,178 @@ public class CalculateAverage_Smoofie {
         }
     }
 
-    private static final class CountResult {
-        private final long cityHashTableAddress;
-        private final long countsAddress;
-        private int cityIdCounter;
-        private long nextCollisionAddress;
+    /**
+     * Per-thread station table. Stations are chained per hash bucket; indexes are stored +1 so that 0 means "none".
+     * Names are not copied: each station remembers where its first occurrence lives in the mapped file.
+     */
+    private static final class StationTable {
+        private final int[] bucketHead = new int[1 << HASH_BITS];
+        private final int[] chainNext = new int[MAX_STATIONS];
+        private final int[] nameLength = new int[MAX_STATIONS];
+        private final long[] nameOffset = new long[MAX_STATIONS];
+        private final int[][] histograms = new int[MAX_STATIONS][]; // [0, BINS) = value >= 0, [BINS, 2*BINS) = -value
+        private int size;
 
-        private CountResult(
-
-                            // cityId|cityLength|cityNameAddress|nextElementAddress|cityCountsAddress
-                            long cityHashTableAddress,
-                            long countsAddress,
-                            int cityIdCounter,
-                            long nextCollisionAddress) {
-            this.cityHashTableAddress = cityHashTableAddress;
-            this.countsAddress = countsAddress;
-            this.cityIdCounter = cityIdCounter;
-            this.nextCollisionAddress = nextCollisionAddress;
+        private int add(int bucket, long offset, int length) {
+            if (size == MAX_STATIONS) {
+                throw new IllegalStateException("More than " + MAX_STATIONS + " distinct stations");
+            }
+            int id = size++;
+            nameOffset[id] = offset;
+            nameLength[id] = length;
+            histograms[id] = new int[2 * BINS];
+            chainNext[id] = bucketHead[bucket];
+            bucketHead[bucket] = id + 1;
+            return id;
         }
-
     }
 
-    private static int hash(long cityNameAddress, short cityLength) {
-        if (cityLength < 17) {
-            long[] city = new long[2];
-            unsafe.copyMemory(null, cityNameAddress, city, Unsafe.ARRAY_LONG_BASE_OFFSET, cityLength);
-            long hash = city[0] ^ (city[1] >> 1);
-            int foldedHash = (int) (hash ^ (hash >>> 31));
-            return (foldedHash & foldedHash >>> 15) & 0xffff;
-        }
-        else {
-            long[] city = new long[cityLength >> 3 + 1];
-            unsafe.copyMemory(null, cityNameAddress, city, Unsafe.ARRAY_LONG_BASE_OFFSET, cityLength);
+    private record ChunkResult(Map<String, MeasurementAggregator> stats, long resumeAt) {
+    }
 
-            long hash = city[0];
-            for (int i = 1; i < city.length; i++) {
-                hash ^= city[i];
+    private static long locateSemicolon(long word) {
+        long x = word ^ 0x3B3B3B3B3B3B3B3BL;
+        return (x - 0x0101010101010101L) & ~x & 0x8080808080808080L;
+    }
+
+    private static int hash(MemorySegment file, long start, int length) {
+        long h = length;
+        int i = 0;
+        for (; i + 8 <= length; i += 8) {
+            h = (h ^ file.get(LONG_LE, start + i)) * HASH_MULTIPLIER;
+        }
+        int remaining = length - i;
+        if (remaining > 0) {
+            long tail = file.get(LONG_LE, start + i) & ((1L << (remaining << 3)) - 1);
+            h = (h ^ tail) * HASH_MULTIPLIER;
+        }
+        return (int) (h >>> (64 - HASH_BITS));
+    }
+
+    private static boolean sameName(MemorySegment file, long a, long b, int length) {
+        int i = 0;
+        for (; i + 8 <= length; i += 8) {
+            if (file.get(LONG_LE, a + i) != file.get(LONG_LE, b + i)) {
+                return false;
+            }
+        }
+        int remaining = length - i;
+        if (remaining == 0) {
+            return true;
+        }
+        long mask = (1L << (remaining << 3)) - 1;
+        return ((file.get(LONG_LE, a + i) ^ file.get(LONG_LE, b + i)) & mask) == 0;
+    }
+
+    private static ChunkResult processChunk(MemorySegment file, long start, long end, long fastLimit) {
+        var table = new StationTable();
+        long limit = Math.min(end, fastLimit);
+        long position = start;
+
+        while (position < limit) {
+            long nameStart = position;
+            long semicolon = locateSemicolon(file.get(LONG_LE, position));
+            while (semicolon == 0) {
+                position += 8;
+                semicolon = locateSemicolon(file.get(LONG_LE, position));
+            }
+            position += Long.numberOfTrailingZeros(semicolon) >> 3;
+            int nameLength = (int) (position - nameStart);
+
+            int bucket = hash(file, nameStart, nameLength);
+            int id = table.bucketHead[bucket] - 1;
+            while (id >= 0 && !(table.nameLength[id] == nameLength && sameName(file, nameStart, table.nameOffset[id], nameLength))) {
+                id = table.chainNext[id] - 1;
+            }
+            if (id < 0) {
+                id = table.add(bucket, nameStart, nameLength);
             }
 
-            int foldedHash = (int) (hash ^ (hash >>> 30));
-            return (foldedHash & foldedHash >>> 15) & 0xffff;
+            position++; // skip semicolon
+            byte c = file.get(BYTE, position++);
+            boolean negative = c == '-';
+            if (negative) {
+                c = file.get(BYTE, position++);
+            }
+            int tenths = c - '0';
+            while ((c = file.get(BYTE, position++)) != '\n') {
+                if (c != '.') {
+                    tenths = tenths * 10 + (c - '0');
+                }
+            }
+            table.histograms[id][negative ? BINS + tenths : tenths]++;
+        }
+
+        var stats = new HashMap<String, MeasurementAggregator>();
+        for (int id = 0; id < table.size; id++) {
+            byte[] name = file.asSlice(table.nameOffset[id], table.nameLength[id]).toArray(BYTE);
+            var aggregator = new MeasurementAggregator();
+            int[] histogram = table.histograms[id];
+            for (int i = 0; i < BINS; i++) {
+                aggregator.add(i, histogram[i]);
+                aggregator.add(-i, histogram[BINS + i]);
+            }
+            stats.put(new String(name, StandardCharsets.UTF_8), aggregator);
+        }
+        return new ChunkResult(stats, position);
+    }
+
+    /** Plain, bounds-safe parsing for the few lines at the very end of the file. */
+    private static void processTail(MemorySegment file, long from, long to, Map<String, MeasurementAggregator> result) {
+        if (from >= to) {
+            return;
+        }
+        String text = new String(file.asSlice(from, to - from).toArray(BYTE), StandardCharsets.UTF_8);
+        for (String line : text.split("\n")) {
+            if (line.isEmpty()) {
+                continue;
+            }
+            int semicolon = line.lastIndexOf(';');
+            int tenths = Integer.parseInt(line.substring(semicolon + 1).replace(".", ""));
+            result.computeIfAbsent(line.substring(0, semicolon), k -> new MeasurementAggregator()).add(tenths, 1);
         }
     }
 
-    private static Unsafe getUnsafe() {
-        try {
-            var field = Unsafe.class.getDeclaredField("theUnsafe");
-            field.setAccessible(true);
-            return (Unsafe) field.get(null);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    public static void main(String[] args) throws IOException, InterruptedException, ExecutionException {
+        try (FileChannel fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+            long fileSize = fileChannel.size();
+            // Arena.global() is fine for a run-once CLI: no scope-close checks in the hot loop and nothing to close.
+            MemorySegment file = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
 
-    private static long locateSemicolon(long input) {
-        long semiXor = input ^ 0x3B3B3B3B3B3B3B3BL;
-        return (semiXor - 0x0101010101010101L) & ~semiXor & 0x8080808080808080L;
-    }
-
-    public static void main(String[] args) throws IOException, InterruptedException {
-        var numberOfThreads = Runtime.getRuntime().availableProcessors();
-        var executorService = Executors.newFixedThreadPool(numberOfThreads);
-        var resultMap = new TreeMap<String, MeasurementAggregator>();
-        var subCountResults = new CountResult[numberOfThreads];
-
-        try (RandomAccessFile randomAccessFile = new RandomAccessFile(FILE, "r");
-                FileChannel fileChannel = randomAccessFile.getChannel()) {
-
-            long fileSize = randomAccessFile.length();
-            if (fileSize < numberOfThreads * 1024) {
-                numberOfThreads = fileSize < 1024 ? 1 : (int) (fileSize / 1024);
+            int numberOfThreads = Runtime.getRuntime().availableProcessors();
+            if (fileSize < numberOfThreads * 1024L) {
+                numberOfThreads = (int) Math.max(1, fileSize / 1024);
             }
             long chunkSize = fileSize / numberOfThreads;
 
-            long inputFileAddress = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
-            final long[] inputFileMemoryOffsets = new long[numberOfThreads + 1];
-            inputFileMemoryOffsets[0] = inputFileAddress;
-            inputFileMemoryOffsets[numberOfThreads] = inputFileAddress + fileSize;
-            for (long i = inputFileAddress + chunkSize, index = 1; index < numberOfThreads; i += chunkSize, index++) {
-                while (unsafe.getByte(i++) != '\n')
+            // Chunk boundaries, moved forward to the next line start.
+            long[] bounds = new long[numberOfThreads + 1];
+            bounds[numberOfThreads] = fileSize;
+            for (int i = 1; i < numberOfThreads; i++) {
+                long p = i * chunkSize;
+                while (file.get(BYTE, p++) != '\n')
                     ;
-                inputFileMemoryOffsets[(int) index] = i;
+                bounds[i] = p;
             }
+            long fastLimit = fileSize - TAIL_MARGIN;
 
-            for (int i = 0; i < numberOfThreads; i++) {
-                final long start = inputFileMemoryOffsets[i];
-                final long end = inputFileMemoryOffsets[i + 1];
+            var resultMap = new TreeMap<String, MeasurementAggregator>();
+            try (var executor = Executors.newFixedThreadPool(numberOfThreads)) {
+                List<Future<ChunkResult>> futures = new ArrayList<>();
+                for (int i = 0; i < numberOfThreads; i++) {
+                    final long start = bounds[i];
+                    final long end = bounds[i + 1];
+                    futures.add(executor.submit(() -> processChunk(file, start, end, fastLimit)));
+                }
 
-                final int threadIndex = i;
-                executorService.execute(() -> {
-                    var cityHashTableAddress = unsafe.allocateMemory(75536 * 32);
-                    unsafe.setMemory(cityHashTableAddress, 75536 * 32, (byte) 0);
-                    long nextCollisionAddress = cityHashTableAddress + (65536 << 5);
-
-                    var countsAddress = unsafe.allocateMemory(10000 * 2 * 1000 * 4);
-                    int cityId;
-                    int temperature = 0;
-                    int cityIdCounter = 0;
-                    long position = start;
-                    byte c;
-                    long input;
-                    long inputSemicolon;
-                    int cityHash;
-                    long hashAddress;
-                    short cityLength;
-                    long cityStart;
-                    long temperatureAddress;
-                    while (position < end) {
-                        cityStart = position;
-                        input = unsafe.getLong(position);
-                        inputSemicolon = locateSemicolon(input);
-                        if (inputSemicolon == 0) {
-                            position += 8;
-                            input = unsafe.getLong(position);
-                            inputSemicolon = locateSemicolon(input);
-
-                            if (inputSemicolon == 0) {
-                                // probably not gonna happen very often
-                                while (inputSemicolon == 0) {
-                                    position += 8;
-                                    input = unsafe.getLong(position);
-                                    inputSemicolon = locateSemicolon(input);
-                                }
-                            }
-                        }
-                        position += Long.numberOfTrailingZeros(inputSemicolon) >> 3;
-
-                        cityLength = (short) (position - cityStart);
-
-                        cityHash = hash(cityStart, cityLength);
-                        hashAddress = cityHashTableAddress + ((long) cityHash << 5);
-                        cityId = -1;
-                        outer: for (;;) {
-                            if (cityLength != unsafe.getShort(hashAddress + 4)) {
-                                if (unsafe.getShort(hashAddress + 4) == 0) {
-                                    // new hash slot init
-                                    cityId = cityIdCounter++;
-                                    unsafe.setMemory(countsAddress + cityId * 8000, 8000, (byte) 0);
-                                    unsafe.putInt(hashAddress, cityId);
-                                    unsafe.putShort(hashAddress + 4, cityLength);
-                                    unsafe.putLong(hashAddress + 6, cityStart);
-                                    unsafe.putLong(hashAddress + 22, countsAddress + cityId * 8000);
-                                    break;
-                                }
-                                if (unsafe.getLong(hashAddress + 14) != 0) {
-                                    hashAddress = unsafe.getLong(hashAddress + 14);
-                                    continue;
-                                }
-                                break;
-                            }
-                            long cityNameAddress = unsafe.getLong(hashAddress + 6);
-                            int j;
-                            for (j = 0; j < cityLength >> 3 << 3; j += 8) {
-                                if (unsafe.getLong(cityStart + j) != unsafe.getLong(cityNameAddress + j)) {
-                                    if (unsafe.getLong(hashAddress + 14) != 0) {
-                                        hashAddress = unsafe.getLong(hashAddress + 14);
-                                        continue outer;
-                                    }
-                                    break outer;
-                                }
-                            }
-                            if (j < cityLength) {
-                                if ((unsafe.getLong(cityStart + j) << ((0x8 - cityLength & 0x7) << 3)) != (unsafe
-                                        .getLong(cityNameAddress + j) << ((0x8 - cityLength & 0x7) << 3))) {
-                                    if (unsafe.getLong(hashAddress + 14) != 0) {
-                                        hashAddress = unsafe.getLong(hashAddress + 14);
-                                        continue;
-                                    }
-                                    break;
-                                }
-                            }
-                            cityId = unsafe.getInt(hashAddress);
-                            break;
-                        }
-
-                        if (cityId == -1) {
-                            // collision
-                            cityId = cityIdCounter++;
-                            unsafe.setMemory(countsAddress + cityId * 8000, 8000, (byte) 0);
-                            unsafe.putLong(hashAddress + 14, nextCollisionAddress);
-                            hashAddress = nextCollisionAddress;
-                            nextCollisionAddress += 32;
-                            unsafe.putInt(hashAddress, cityId);
-                            unsafe.putShort(hashAddress + 4, cityLength);
-                            unsafe.putLong(hashAddress + 6, cityStart);
-                            unsafe.putLong(hashAddress + 22, countsAddress + cityId * 8000);
-                        }
-
-                        position++; // skip semicolon
-
-                        // long inputDecimalPoint = locateDecimalPoint(unsafe.getLong(position));
-                        // position += (Long.numberOfTrailingZeros(inputDecimalPoint) >> 3) + 3;
-
-                        temperature = 0;
-                        c = unsafe.getByte(position++);
-                        if (c == '-') {
-                            while ((c = unsafe.getByte(position++)) != '\n') {
-                                if (c != '.') {
-                                    temperature = temperature * 10 + (c ^ 0x30);
-                                }
-                            }
-                            temperatureAddress = unsafe.getLong(hashAddress + 22) + (1000 + temperature) * 4;
-                            unsafe.putInt(temperatureAddress, unsafe.getInt(temperatureAddress) + 1);
-                        }
-                        else {
-                            temperature = c - '0';
-                            while ((c = unsafe.getByte(position++)) != '\n') {
-                                if (c != '.') {
-                                    temperature = temperature * 10 + (c ^ 0x30);
-                                }
-                            }
-
-                            temperatureAddress = unsafe.getLong(hashAddress + 22) + temperature * 4;
-                            unsafe.putInt(temperatureAddress, unsafe.getInt(temperatureAddress) + 1);
-                        }
-                    }
-                    subCountResults[threadIndex] = new CountResult(cityHashTableAddress, countsAddress, cityIdCounter, nextCollisionAddress);
-                });
+                long tailStart = 0;
+                for (Future<ChunkResult> future : futures) {
+                    ChunkResult chunk = future.get(); // rethrows worker failures instead of swallowing them
+                    chunk.stats().forEach((name, stats) -> resultMap.computeIfAbsent(name, k -> new MeasurementAggregator()).merge(stats));
+                    tailStart = chunk.resumeAt(); // only the last chunk can stop before its end
+                }
+                processTail(file, tailStart, fileSize, resultMap);
             }
-
-            executorService.shutdown();
-            executorService.awaitTermination(120, java.util.concurrent.TimeUnit.SECONDS);
-
-            // aggregate results 1..n to 0
-            var subCountA = subCountResults[0];
-            for (int r = 1; r < numberOfThreads; r++) {
-                CountResult subCountB = subCountResults[r];
-                for (int i = 0; i < 65536; i++) {
-                    long bHashAddress = subCountB.cityHashTableAddress + ((long) i << 5);
-                    if (unsafe.getShort(bHashAddress + 4) == 0) {
-                        continue;
-                    }
-                    long aHashAddress = subCountA.cityHashTableAddress + ((long) i << 5);
-                    // check if a initialized
-                    if (unsafe.getShort(aHashAddress + 4) == 0) {
-                        // new hash slot init
-                        for (long addressA = aHashAddress, addressB = bHashAddress; addressB != 0;) {
-                            unsafe.putInt(addressA, subCountA.cityIdCounter++);
-                            unsafe.putShort(addressA + 4, unsafe.getShort(addressB + 4));
-                            unsafe.putLong(addressA + 6, unsafe.getLong(addressB + 6));
-                            addressB = unsafe.getLong(addressB + 14);
-                            if (addressB != 0) {
-                                unsafe.putLong(addressA + 14, subCountA.nextCollisionAddress);
-                                addressA = subCountA.nextCollisionAddress;
-                                subCountA.nextCollisionAddress += 32;
-                            }
-                        }
-                    }
-                    else {
-                        // check to copy collision list too
-                        outerB: for (long addressB = bHashAddress; addressB != 0; addressB = unsafe.getLong(addressB + 14)) {
-                            short cityLength = unsafe.getShort(addressB + 4);
-                            long cityNameAddress = unsafe.getLong(addressB + 6);
-                            // compare to each city in A slot
-                            outerA: for (long aAddress = aHashAddress; aAddress != 0; aAddress = unsafe.getLong(aAddress + 14)) {
-                                if (unsafe.getShort(aAddress + 4) == cityLength) {
-                                    long aCityNameAddress = unsafe.getLong(aAddress + 6);
-                                    int j;
-                                    for (j = 0; j < cityLength >> 3 << 3; j += 8) {
-                                        if (unsafe.getLong(cityNameAddress + j) != unsafe.getLong(aCityNameAddress + j)) {
-                                            // nope, not the same, try next
-                                            continue outerA;
-                                        }
-                                    }
-                                    if (j == cityLength ||
-                                            (unsafe.getLong(cityNameAddress + j) << ((0x8 - cityLength & 0x7) << 3)) == (unsafe
-                                                    .getLong(aCityNameAddress + j) << ((0x8 - cityLength & 0x7) << 3))) {
-                                        // found the same city, continue with next city in B slot
-                                        continue outerB;
-                                    }
-                                }
-                            }
-                            // city not found in A slot, add it. It's a collision too
-                            long addressA = aHashAddress;
-                            while (unsafe.getLong(addressA + 14) != 0) {
-                                addressA = unsafe.getLong(addressA + 14);
-                            }
-                            unsafe.putLong(addressA + 14, subCountA.nextCollisionAddress);
-                            addressA = subCountA.nextCollisionAddress;
-                            subCountA.nextCollisionAddress += 32;
-
-                            unsafe.putInt(addressA, subCountA.cityIdCounter++);
-                            unsafe.putShort(addressA + 4, cityLength);
-                            unsafe.putLong(addressA + 6, cityNameAddress);
-                        }
-                    }
-                }
-
-                int[] cityIdMap = new int[10000];
-                for (int i = 0; i < 10000; i++) {
-                    cityIdMap[i] = -1;
-                }
-
-                for (int i = 0; i < 65536; i++) {
-                    long bHashAddress = subCountB.cityHashTableAddress + ((long) i << 5);
-                    long aHashAddress = subCountA.cityHashTableAddress + ((long) i << 5);
-                    if (unsafe.getShort(aHashAddress + 4) == 0) {
-                        continue;
-                    }
-                    // for each city in A slot
-                    outerA: for (long aAddress = aHashAddress; aAddress != 0; aAddress = unsafe.getLong(aAddress + 14)) {
-                        short cityLength = unsafe.getShort(aAddress + 4);
-                        long cityNameAddress = unsafe.getLong(aAddress + 6);
-                        int cityIdA = unsafe.getInt(aAddress);
-                        // compare to each city in B slot
-                        outer: for (long bAddress = bHashAddress; bAddress != 0; bAddress = unsafe.getLong(bAddress + 14)) {
-                            if (unsafe.getShort(bAddress + 4) == cityLength) {
-                                long bCityNameAddress = unsafe.getLong(bAddress + 6);
-                                int j;
-                                for (j = 0; j < cityLength >> 3 << 3; j += 8) {
-                                    if (unsafe.getLong(cityNameAddress + j) != unsafe.getLong(bCityNameAddress + j)) {
-                                        // nope, not the same, try next
-                                        continue outer;
-                                    }
-                                }
-                                if (j == cityLength ||
-                                        (unsafe.getLong(cityNameAddress + j) << ((0x8 - cityLength & 0x7) << 3)) == (unsafe
-                                                .getLong(bCityNameAddress + j) << ((0x8 - cityLength & 0x7) << 3))) {
-                                    cityIdMap[cityIdA] = unsafe.getInt(bAddress);
-                                    // found the same city, continue with next city in A slot
-                                    continue outerA;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for (int i = 0; i < subCountA.cityIdCounter; i++) {
-                    int cityId2 = cityIdMap[i];
-                    if (cityId2 != -1) {
-                        for (int j = 0; j < 2; j++) {
-                            for (int k = 0; k < 1000; k++) {
-                                unsafe.putInt(subCountA.countsAddress + i * 8000 + j * 4000 + k * 4,
-                                        unsafe.getInt(subCountA.countsAddress + i * 8000 + j * 4000 + k * 4) +
-                                                unsafe.getInt(subCountB.countsAddress + cityId2 * 8000 + j * 4000 + k * 4));
-                            }
-                        }
-                    }
-                }
-            }
-
-            var countResult = subCountResults[0];
-            var reverseCityIds = new String[10000];
-            for (int i = 0; i < 65536; i++) {
-                long resultHashAddress = countResult.cityHashTableAddress + ((long) i << 5);
-                if (unsafe.getShort(resultHashAddress + 4) != 0) {
-                    for (long address = resultHashAddress; address != 0; address = unsafe.getLong(address + 14)) {
-                        int cityId = unsafe.getInt(address);
-                        int cityLength = unsafe.getShort(address + 4);
-                        long cityNameAddress = unsafe.getLong(address + 6);
-                        byte[] cityBytes = new byte[cityLength];
-                        unsafe.copyMemory(null, cityNameAddress, cityBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, cityLength);
-                        reverseCityIds[cityId] = new String(cityBytes, StandardCharsets.UTF_8);
-                    }
-                }
-            }
-
-            // count result as stream
-            IntStream.range(0, 10000).parallel().forEach(cityId -> {
-                var cityName = reverseCityIds[cityId];
-                if (cityName == null) {
-                    return;
-                }
-                var cityAddress = countResult.countsAddress + cityId * 8000;
-                var cityResult = new MeasurementAggregator();
-                for (int i = 999; i > -1; i--) {
-                    if (unsafe.getInt(cityAddress + 4000 + i * 4) > 0) {
-                        cityResult.min = -i;
-                        break;
-                    }
-                }
-                if (cityResult.min == -1000) {
-                    for (int i = 0; i < 1000; i++) {
-                        if (unsafe.getInt(cityAddress + i * 4) > 0) {
-                            cityResult.min = i;
-                            break;
-                        }
-                    }
-                }
-                for (int i = 999; i > -1; i--) {
-                    if (unsafe.getInt(cityAddress + i * 4) > 0) {
-                        cityResult.max = i;
-                        break;
-                    }
-                }
-                if (cityResult.max == 1000) {
-                    for (int i = 0; i < 1000; i++) {
-                        if (unsafe.getInt(cityAddress + 4000 + i * 4) > 0) {
-                            cityResult.max = -i;
-                            break;
-                        }
-                    }
-                }
-                for (int i = 0; i < 1000; i++) {
-                    cityResult.sum += ((long) unsafe.getInt(cityAddress + i * 4)) * i;
-                    cityResult.sum -= ((long) unsafe.getInt(cityAddress + 4000 + i * 4)) * i;
-                    cityResult.count += unsafe.getInt(cityAddress + i * 4);
-                    cityResult.count += unsafe.getInt(cityAddress + 4000 + i * 4);
-                }
-                synchronized (resultMap) {
-                    resultMap.put(cityName, cityResult);
-                }
-            });
 
             System.out.println(resultMap);
         }

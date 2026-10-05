@@ -17,7 +17,11 @@ package dev.morling.onebrc;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -27,8 +31,6 @@ import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
-
-import sun.misc.Unsafe;
 
 /**
  * Changelog:
@@ -66,6 +68,11 @@ import sun.misc.Unsafe;
  * Decided to rewrite loop for 16 b: 3050 ms
  * Small changes, limited heap:      2950 ms
  *
+ * Java 27 port: sun.misc.Unsafe is gone. The flyweight byte[] entries are now accessed
+ * through a byte-array-view VarHandle and the memory mapped file through a MemorySegment.
+ * Because MemorySegment is bounds checked (Unsafe was not), the last few lines of the file
+ * are parsed from a zero padded copy instead of reading past the end of the mapping.
+ *
  * I have some instructions that could be removed, but faster with...
  *
  * Big thanks to Francesco Nigro, Thomas Wuerthinger, Quan Anh Mai and many others for ideas.
@@ -77,30 +84,35 @@ public class CalculateAverage_royvanrijn {
     private static final String FILE = "./measurements.txt";
     // private static final String FILE = "src/test/resources/samples/measurements-1.txt";
 
-    private static final Unsafe UNSAFE = initUnsafe();
-
     // Twice the processors, smoothens things out.
     private static final int PROCESSORS = Runtime.getRuntime().availableProcessors();
+
+    // Native byte order views, plain (non-atomic) access may be unaligned:
+    private static final VarHandle LONG_VIEW = MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.nativeOrder());
+    private static final VarHandle INT_VIEW = MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.nativeOrder());
+
+    // Unaligned, native byte order access into the (mapped) file:
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED;
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
 
     /**
      * Flyweight entry in a byte[], max 128 bytes.
      * <p>
+     * byte: length
      * long: sum
      * int:  min
      * int:  max
      * int:  count
-     * byte: length
      * byte[]: cityname
      */
     // ------------------------------------------------------------------------
-    private static final int ENTRY_LENGTH = (Unsafe.ARRAY_BYTE_BASE_OFFSET);
+    // These are plain indexes into the byte[] (no more Unsafe.ARRAY_BYTE_BASE_OFFSET).
+    private static final int ENTRY_LENGTH = 0;
     private static final int ENTRY_SUM = (ENTRY_LENGTH + Byte.BYTES);
     private static final int ENTRY_MIN = (ENTRY_SUM + Long.BYTES);
     private static final int ENTRY_MAX = (ENTRY_MIN + Integer.BYTES);
     private static final int ENTRY_COUNT = (ENTRY_MAX + Integer.BYTES);
     private static final int ENTRY_NAME = (ENTRY_COUNT + Integer.BYTES);
-    private static final int ENTRY_NAME_8 = ENTRY_NAME + 8;
-    private static final int ENTRY_NAME_16 = ENTRY_NAME + 16;
 
     private static final int ENTRY_BASESIZE_WHITESPACE = ENTRY_NAME + 7; // with enough empty bytes to fill a long
     // ------------------------------------------------------------------------
@@ -108,6 +120,12 @@ public class CalculateAverage_royvanrijn {
     private static final int PREMADE_ENTRIES = 512; // amount of pre-created entries we should use
     private static final int TABLE_SIZE = 1 << 19; // large enough for the contest.
     private static final int TABLE_MASK = (TABLE_SIZE - 1);
+
+    // The parser reads whole longs and can look a few bytes past the end of a line. A line
+    // starting more than this many bytes before the end of the file can never reach past it
+    // (max line is 107 bytes, max over-read is below 8), so only the last bit needs padding.
+    private static final int TAIL_MARGIN = 256;
+    private static final int TAIL_PADDING = 32;
 
     // Idea of thomaswue, don't wait for slow unmap:
     private static void spawnWorker() throws IOException {
@@ -133,27 +151,31 @@ public class CalculateAverage_royvanrijn {
         }
 
         // Calculate input segments.
-        final FileChannel fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ);
-        final long fileSize = fileChannel.size();
+        final long fileSize;
+        final MemorySegment file;
+        try (FileChannel fileChannel = FileChannel.open(Path.of(FILE), StandardOpenOption.READ)) {
+            fileSize = fileChannel.size();
+            // The mapping stays valid after the channel is closed (global arena, never unmapped):
+            file = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global());
+        }
         final long segmentSize = (fileSize + PROCESSORS - 1) / PROCESSORS;
-        final long mapAddress = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.global()).address();
 
         final Thread[] parallelThreads = new Thread[PROCESSORS - 1];
 
         // This is where the entries will land:
-        final ConcurrentHashMap<String, byte[]> measurements = new ConcurrentHashMap(1 << 10);
+        final ConcurrentHashMap<String, byte[]> measurements = new ConcurrentHashMap<>(1 << 10);
 
         // We create separate threads for twice the amount of processors.
-        long lastAddress = mapAddress;
-        final long endOfFile = mapAddress + fileSize;
+        // (offsets are relative to the start of the mapped file)
+        long lastOffset = 0;
         for (int i = 0; i < PROCESSORS - 1; ++i) {
 
-            final long fromAddress = lastAddress;
-            final long toAddress = Math.min(endOfFile, fromAddress + segmentSize);
+            final long from = lastOffset;
+            final long to = Math.min(fileSize, from + segmentSize);
 
             final Thread thread = new Thread(() -> {
                 // The actual work is done here:
-                final byte[][] table = processMemoryArea(fromAddress, toAddress, fromAddress == mapAddress);
+                final byte[][] table = processMemoryArea(file, from, to, from == 0);
 
                 for (byte[] entry : table) {
                     if (entry != null) {
@@ -163,11 +185,12 @@ public class CalculateAverage_royvanrijn {
             });
             thread.start(); // start a.s.a.p.
             parallelThreads[i] = thread;
-            lastAddress = toAddress;
+            lastOffset = to;
         }
 
-        // Use the current thread for the part of memory:
-        final byte[][] table = processMemoryArea(lastAddress, mapAddress + fileSize, false);
+        // Use the current thread for the part of memory (with a single processor that is the whole file,
+        // which starts on a line boundary, so nothing should be skipped):
+        final byte[][] table = processMemoryArea(file, lastOffset, fileSize, lastOffset == 0);
 
         for (byte[] entry : table) {
             if (entry != null) {
@@ -190,96 +213,106 @@ public class CalculateAverage_royvanrijn {
         System.out.close(); // close the stream to stop
     }
 
-    private static byte[] fillEntry(final byte[] entry, final long fromAddress, final int entryLength, final int temp, final long readBuffer1, final long readBuffer2) {
-        UNSAFE.putLong(entry, ENTRY_SUM, temp);
-        UNSAFE.putInt(entry, ENTRY_MIN, temp);
-        UNSAFE.putInt(entry, ENTRY_MAX, temp);
-        UNSAFE.putInt(entry, ENTRY_COUNT, 1);
-        UNSAFE.putByte(entry, ENTRY_LENGTH, (byte) entryLength);
-        UNSAFE.copyMemory(null, fromAddress, entry, ENTRY_NAME, entryLength - 16);
-        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 16, readBuffer1);
-        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 8, readBuffer2);
+    // ------------------------------------------------------------------------
+    // Tiny accessors replacing the Unsafe calls on the flyweight byte[] entries:
+    private static long getLong(final byte[] entry, final int index) {
+        return (long) LONG_VIEW.get(entry, index);
+    }
+
+    private static void putLong(final byte[] entry, final int index, final long value) {
+        LONG_VIEW.set(entry, index, value);
+    }
+
+    private static int getInt(final byte[] entry, final int index) {
+        return (int) INT_VIEW.get(entry, index);
+    }
+
+    private static void putInt(final byte[] entry, final int index, final int value) {
+        INT_VIEW.set(entry, index, value);
+    }
+    // ------------------------------------------------------------------------
+
+    private static byte[] fillEntry(final byte[] entry, final MemorySegment source, final long fromOffset, final int entryLength, final int temp, final long readBuffer1,
+                                    final long readBuffer2) {
+        putLong(entry, ENTRY_SUM, temp);
+        putInt(entry, ENTRY_MIN, temp);
+        putInt(entry, ENTRY_MAX, temp);
+        putInt(entry, ENTRY_COUNT, 1);
+        entry[ENTRY_LENGTH] = (byte) entryLength;
+        // entryLength is a multiple of 16, so this is a whole number of longs:
+        for (int i = 0; i < entryLength - 16; i += 8) {
+            putLong(entry, ENTRY_NAME + i, source.get(LONG, fromOffset + i));
+        }
+        putLong(entry, ENTRY_NAME + entryLength - 16, readBuffer1);
+        putLong(entry, ENTRY_NAME + entryLength - 8, readBuffer2);
         return entry;
     }
 
     private static byte[] fillEntry16(final byte[] entry, final int entryLength, final int temp, final long readBuffer1, final long readBuffer2) {
-        UNSAFE.putLong(entry, ENTRY_SUM, temp);
-        UNSAFE.putInt(entry, ENTRY_MIN, temp);
-        UNSAFE.putInt(entry, ENTRY_MAX, temp);
-        UNSAFE.putInt(entry, ENTRY_COUNT, 1);
-        UNSAFE.putByte(entry, ENTRY_LENGTH, (byte) entryLength);
-        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 16, readBuffer1);
-        UNSAFE.putLong(entry, ENTRY_NAME + entryLength - 8, readBuffer2);
+        putLong(entry, ENTRY_SUM, temp);
+        putInt(entry, ENTRY_MIN, temp);
+        putInt(entry, ENTRY_MAX, temp);
+        putInt(entry, ENTRY_COUNT, 1);
+        entry[ENTRY_LENGTH] = (byte) entryLength;
+        putLong(entry, ENTRY_NAME + entryLength - 16, readBuffer1);
+        putLong(entry, ENTRY_NAME + entryLength - 8, readBuffer2);
         return entry;
     }
 
     public static void updateEntry(final byte[] entry, final int temp) {
 
-        int entryMin = UNSAFE.getInt(entry, ENTRY_MIN);
-        int entryMax = UNSAFE.getInt(entry, ENTRY_MAX);
-        long entrySum = UNSAFE.getLong(entry, ENTRY_SUM) + temp;
-        int entryCount = UNSAFE.getInt(entry, ENTRY_COUNT) + 1;
+        int entryMin = getInt(entry, ENTRY_MIN);
+        int entryMax = getInt(entry, ENTRY_MAX);
+        long entrySum = getLong(entry, ENTRY_SUM) + temp;
+        int entryCount = getInt(entry, ENTRY_COUNT) + 1;
 
         if (temp < entryMin) {
-            UNSAFE.putInt(entry, ENTRY_MIN, temp);
+            putInt(entry, ENTRY_MIN, temp);
         }
         else if (temp > entryMax) {
-            UNSAFE.putInt(entry, ENTRY_MAX, temp);
+            putInt(entry, ENTRY_MAX, temp);
         }
-        UNSAFE.putInt(entry, ENTRY_COUNT, entryCount);
-        UNSAFE.putLong(entry, ENTRY_SUM, entrySum);
+        putInt(entry, ENTRY_COUNT, entryCount);
+        putLong(entry, ENTRY_SUM, entrySum);
     }
 
     public static byte[] mergeEntry(final byte[] entry, final byte[] merge) {
 
-        long sum = UNSAFE.getLong(merge, ENTRY_SUM);
-        final int mergeMin = UNSAFE.getInt(merge, ENTRY_MIN);
-        final int mergeMax = UNSAFE.getInt(merge, ENTRY_MAX);
-        int count = UNSAFE.getInt(merge, ENTRY_COUNT);
+        long sum = getLong(merge, ENTRY_SUM);
+        final int mergeMin = getInt(merge, ENTRY_MIN);
+        final int mergeMax = getInt(merge, ENTRY_MAX);
+        int count = getInt(merge, ENTRY_COUNT);
 
-        sum += UNSAFE.getLong(entry, ENTRY_SUM);
-        count += UNSAFE.getInt(entry, ENTRY_COUNT);
+        sum += getLong(entry, ENTRY_SUM);
+        count += getInt(entry, ENTRY_COUNT);
 
-        int entryMin = UNSAFE.getInt(entry, ENTRY_MIN);
-        int entryMax = UNSAFE.getInt(entry, ENTRY_MAX);
+        int entryMin = getInt(entry, ENTRY_MIN);
+        int entryMax = getInt(entry, ENTRY_MAX);
         entryMin = Math.min(entryMin, mergeMin);
         entryMax = Math.max(entryMax, mergeMax);
-        UNSAFE.putInt(entry, ENTRY_MIN, entryMin);
-        UNSAFE.putInt(entry, ENTRY_MAX, entryMax);
+        putInt(entry, ENTRY_MIN, entryMin);
+        putInt(entry, ENTRY_MAX, entryMax);
 
-        UNSAFE.putLong(entry, ENTRY_SUM, sum);
-        UNSAFE.putInt(entry, ENTRY_COUNT, count);
+        putLong(entry, ENTRY_SUM, sum);
+        putInt(entry, ENTRY_COUNT, count);
         return entry;
     }
 
     private static String entryToName(final byte[] entry) {
-        // Get the length from memory:
-        int length = UNSAFE.getByte(entry, ENTRY_LENGTH);
+        // Get the length from the entry:
+        int length = entry[ENTRY_LENGTH];
 
-        byte[] name = new byte[length];
-        UNSAFE.copyMemory(entry, ENTRY_NAME, name, Unsafe.ARRAY_BYTE_BASE_OFFSET, length);
-
-        // Create a new String with the existing byte[]:
-        return new String(name, StandardCharsets.UTF_8).trim();
+        // Create a new String straight from the entry (the zero padding is trimmed again):
+        return new String(entry, ENTRY_NAME, length, StandardCharsets.UTF_8).trim();
     }
 
     private static String entryValuesToString(final byte[] entry) {
-        return (round(UNSAFE.getInt(entry, ENTRY_MIN))
+        return (round(getInt(entry, ENTRY_MIN))
                 + "/" +
-                round((1.0 * UNSAFE.getLong(entry, ENTRY_SUM)) /
-                        UNSAFE.getInt(entry, ENTRY_COUNT))
+                round((1.0 * getLong(entry, ENTRY_SUM)) /
+                        getInt(entry, ENTRY_COUNT))
                 + "/" +
-                round(UNSAFE.getInt(entry, ENTRY_MAX)));
-    }
-
-    // Print a piece of memory:
-    // For debug.
-    private static String printMemory(final Object target, final long address, int length) {
-        String result = "";
-        for (int i = 0; i < length; i++) {
-            result += (char) UNSAFE.getByte(target, address + i);
-        }
-        return result;
+                round(getInt(entry, ENTRY_MAX)));
     }
 
     // Print a piece of memory:
@@ -298,6 +331,7 @@ public class CalculateAverage_royvanrijn {
 
     private static final class Reader {
 
+        private final MemorySegment source;
         private long ptr;
         private long readBuffer1;
         private long readBuffer2;
@@ -308,16 +342,20 @@ public class CalculateAverage_royvanrijn {
 
         private final long endAddress;
 
-        Reader(final long startAddress, final long endAddress, final boolean isFileStart) {
+        /**
+         * @param isLineStart true if startOffset is known to be the first byte of a line
+         */
+        Reader(final MemorySegment source, final long startOffset, final long endOffset, final boolean isLineStart) {
 
-            this.ptr = startAddress;
-            this.endAddress = endAddress;
+            this.source = source;
+            this.ptr = startOffset;
+            this.endAddress = endOffset;
 
             // Adjust start to next delimiter:
-            if (!isFileStart) {
+            if (!isLineStart) {
                 ptr--;
                 while (ptr < endAddress) {
-                    if (UNSAFE.getByte(ptr++) == '\n') {
+                    if (source.get(BYTE, ptr++) == '\n') {
                         break;
                     }
                 }
@@ -330,15 +368,11 @@ public class CalculateAverage_royvanrijn {
             entryLength = 0;
         }
 
-        private boolean hasNext() {
-            return (ptr < endAddress);
-        }
-
         private static final long DELIMITER_MASK = 0x3B3B3B3B3B3B3B3BL;
 
         private boolean readNext() {
 
-            long lastRead = UNSAFE.getLong(ptr);
+            long lastRead = source.get(LONG, ptr);
 
             entryLength += 16;
 
@@ -362,7 +396,7 @@ public class CalculateAverage_royvanrijn {
                 return false;
             }
 
-            lastRead = UNSAFE.getLong(ptr + 8);
+            lastRead = source.get(LONG, ptr + 8);
 
             // Repeat for long2
             long comparisonResult2 = (lastRead ^ DELIMITER_MASK);
@@ -402,7 +436,7 @@ public class CalculateAverage_royvanrijn {
         // Awesome idea of merykitty:
         private int readTemperature() {
             // This is the number part: X.X, -X.X, XX.x or -XX.X
-            final long numberBytes = UNSAFE.getLong(ptr);
+            final long numberBytes = source.get(LONG, ptr);
             final long invNumberBytes = ~numberBytes;
 
             final int dotPosition = Long.numberOfTrailingZeros(invNumberBytes & DOT_BITS);
@@ -426,7 +460,7 @@ public class CalculateAverage_royvanrijn {
         private boolean matches(final byte[] entry) {
             int step = 0;
             for (; step < entryLength - 16;) {
-                if (compare(null, entryStart + step, entry, ENTRY_NAME + step)) {
+                if (compare(source, entryStart + step, entry, ENTRY_NAME + step)) {
                     return false;
                 }
                 step += 8;
@@ -452,18 +486,45 @@ public class CalculateAverage_royvanrijn {
         }
     }
 
-    private static byte[][] processMemoryArea(final long startAddress, final long endAddress, boolean isFileStart) {
+    /**
+     * The hash table of one worker, plus the pool of pre-allocated entries.
+     */
+    private static final class Table {
+        private final byte[][] slots = new byte[TABLE_SIZE][];
+        private final byte[][] preConstructedEntries = new byte[PREMADE_ENTRIES][ENTRY_BASESIZE_WHITESPACE + PREMADE_MAX_SIZE];
+        private int entryCount = 0;
+    }
 
-        final byte[][] table = new byte[TABLE_SIZE][];
-        final byte[][] preConstructedEntries = new byte[PREMADE_ENTRIES][ENTRY_BASESIZE_WHITESPACE + PREMADE_MAX_SIZE];
+    private static byte[][] processMemoryArea(final MemorySegment file, final long startOffset, final long endOffset, final boolean isFileStart) {
 
-        final Reader reader = new Reader(startAddress, endAddress, isFileStart);
+        final Table table = new Table();
+        final long fileSize = file.byteSize();
+
+        // Fast path: whole lines that can't make us read beyond the end of the mapping.
+        final long safeLimit = Math.min(endOffset, fileSize - TAIL_MARGIN);
+        final Reader reader = new Reader(file, startOffset, endOffset, isFileStart);
+        processLines(reader, table, safeLimit);
+
+        // Slow path (at most a few lines, only for the worker that owns the end of the file):
+        // parse the remainder from a zero padded copy, so the long reads can't go out of bounds.
+        if (reader.ptr < endOffset) {
+            final long tailStart = reader.ptr;
+            final MemorySegment tail = MemorySegment.ofArray(new byte[(int) (fileSize - tailStart) + TAIL_PADDING]);
+            MemorySegment.copy(file, tailStart, tail, 0, fileSize - tailStart);
+            final long tailEnd = endOffset - tailStart;
+            processLines(new Reader(tail, 0, tailEnd, true), table, tailEnd);
+        }
+        return table.slots;
+    }
+
+    private static void processLines(final Reader reader, final Table table, final long limit) {
+
+        final byte[][] slots = table.slots;
 
         byte[] entry;
-        int entryCount = 0;
 
         // Find the correct starting position
-        while (reader.hasNext()) {
+        while (reader.ptr < limit) {
 
             reader.processStart();
 
@@ -475,11 +536,11 @@ public class CalculateAverage_royvanrijn {
                 // Find or insert the entry:
                 int index = (int) (reader.hash & TABLE_MASK);
                 while (true) {
-                    entry = table[index];
+                    entry = slots[index];
                     if (entry == null) {
-                        byte[] entryBytes = (entryCount < PREMADE_ENTRIES) ? preConstructedEntries[entryCount++]
+                        byte[] entryBytes = (table.entryCount < PREMADE_ENTRIES) ? table.preConstructedEntries[table.entryCount++]
                                 : new byte[ENTRY_BASESIZE_WHITESPACE + 16]; // with enough room
-                        table[index] = fillEntry16(entryBytes, 16, temperature, reader.readBuffer1, reader.readBuffer2);
+                        slots[index] = fillEntry16(entryBytes, 16, temperature, reader.readBuffer1, reader.readBuffer2);
                         break;
                     }
                     else if (reader.matches16(entry)) {
@@ -501,12 +562,12 @@ public class CalculateAverage_royvanrijn {
             // Find or insert the entry:
             int index = (int) (reader.hash & TABLE_MASK);
             while (true) {
-                entry = table[index];
+                entry = slots[index];
                 if (entry == null) {
                     int length = reader.entryLength;
-                    byte[] entryBytes = (length < PREMADE_MAX_SIZE && entryCount < PREMADE_ENTRIES) ? preConstructedEntries[entryCount++]
+                    byte[] entryBytes = (length < PREMADE_MAX_SIZE && table.entryCount < PREMADE_ENTRIES) ? table.preConstructedEntries[table.entryCount++]
                             : new byte[ENTRY_BASESIZE_WHITESPACE + length]; // with enough room
-                    table[index] = fillEntry(entryBytes, reader.entryStart, length, temperature, reader.readBuffer1, reader.readBuffer2);
+                    slots[index] = fillEntry(entryBytes, reader.source, reader.entryStart, length, temperature, reader.readBuffer1, reader.readBuffer2);
                     break;
                 }
                 else if (reader.matches(entry)) {
@@ -519,15 +580,15 @@ public class CalculateAverage_royvanrijn {
                 }
             }
         }
-        return table;
     }
 
-    private static boolean compare(final Object object1, final long address1, final Object object2, final long address2) {
-        return UNSAFE.getLong(object1, address1) != UNSAFE.getLong(object2, address2);
+    // Returns true if the 8 bytes in the file differ from the 8 bytes in the entry:
+    private static boolean compare(final MemorySegment source, final long offset1, final byte[] entry, final int index2) {
+        return source.get(LONG, offset1) != getLong(entry, index2);
     }
 
-    private static boolean compare(final long value1, final Object object2, final long address2) {
-        return value1 != UNSAFE.getLong(object2, address2);
+    private static boolean compare(final long value1, final byte[] entry, final int index2) {
+        return value1 != getLong(entry, index2);
     }
 
     /*
@@ -539,15 +600,4 @@ public class CalculateAverage_royvanrijn {
      *
      * https://www.openvalue.eu/
      */
-
-    private static Unsafe initUnsafe() {
-        try {
-            final Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
 }

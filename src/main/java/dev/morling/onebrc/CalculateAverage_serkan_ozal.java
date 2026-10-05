@@ -18,13 +18,12 @@ package dev.morling.onebrc;
 import jdk.incubator.vector.ByteVector;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
-import sun.misc.Unsafe;
 
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
@@ -41,11 +40,33 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
+ * Java 27 compatible version.
+ * <p>
+ * Differences from the original:
+ * <ul>
+ * <li>No {@code sun.misc.Unsafe}. Its memory-access methods are deprecated for removal and throw
+ * {@code UnsupportedOperationException} by default since JDK 26. All raw accesses now go through the
+ * standard FFM API ({@link MemorySegment}), final since JDK 22, using absolute addresses.</li>
+ * <li>The hash map lives in native memory instead of a {@code byte[]}, so it no longer depends on
+ * array base offsets or object-header layout (compact object headers are the default in JDK 27) and it
+ * is not a humongous heap allocation under G1 (the default GC in all environments in JDK 27).</li>
+ * <li>All multi-byte accesses use explicit little-endian layouts, so there are no
+ * {@code BIG_ENDIAN} special cases anymore.</li>
+ * </ul>
+ * <p>
+ * Build:
+ * {@code javac --add-modules jdk.incubator.vector -d out CalculateAverage_serkan_ozal.java}
+ * <br>
+ * Run:
+ * {@code java --add-modules jdk.incubator.vector --enable-native-access=ALL-UNNAMED -cp out dev.morling.onebrc.CalculateAverage_serkan_ozal}
+ * <p>
+ * ({@code jdk.incubator.vector} is still an incubator module in JDK 27, JEP 537, and
+ * {@code MemorySegment::reinterpret} is a restricted method, hence the two flags.)
+ *
  * @author serkan-ozal
  */
 public class CalculateAverage_serkan_ozal {
@@ -59,11 +80,10 @@ public class CalculateAverage_serkan_ozal {
             ? ByteVector.SPECIES_128
             : ByteVector.SPECIES_64;
     private static final int BYTE_SPECIES_SIZE = BYTE_SPECIES.vectorByteSize();
-    private static final MemorySegment NULL = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
     private static final ByteOrder NATIVE_BYTE_ORDER = ByteOrder.nativeOrder();
 
-    private static final char NEW_LINE_SEPARATOR = '\n';
-    private static final char KEY_VALUE_SEPARATOR = ';';
+    private static final byte NEW_LINE_SEPARATOR = '\n';
+    private static final byte KEY_VALUE_SEPARATOR = ';';
     private static final int MAX_LINE_LENGTH = 128;
 
     // Get configurations
@@ -79,19 +99,46 @@ public class CalculateAverage_serkan_ozal {
     private static final boolean CLOSE_STDOUT_ON_RESULT = true; // getBooleanConfig("CLOSE_STDOUT_ON_RESULT", true);
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // My dear old friend Unsafe
-    private static final Unsafe U;
+    // Raw memory access (replacement of sun.misc.Unsafe)
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    // A zero-based segment spanning the whole address space, so plain addresses (as obtained from
+    // MemorySegment::address) can be used as offsets. This is the supported equivalent of Unsafe's
+    // absolute-address accessors. Note that "reinterpret" is a restricted method (--enable-native-access).
+    private static final MemorySegment MEM = MemorySegment.NULL.reinterpret(Long.MAX_VALUE);
 
-    static {
-        try {
-            Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            U = (Unsafe) f.get(null);
-        }
-        catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
+    // Unaligned + explicit little-endian: same semantics on every platform and no alignment assumptions.
+    private static final ValueLayout.OfShort SHORT_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+
+    private static byte getByte(long address) {
+        return MEM.get(ValueLayout.JAVA_BYTE, address);
     }
+
+    private static short getShort(long address) {
+        return MEM.get(SHORT_LE, address);
+    }
+
+    private static int getInt(long address) {
+        return MEM.get(INT_LE, address);
+    }
+
+    private static long getLong(long address) {
+        return MEM.get(LONG_LE, address);
+    }
+
+    private static void putShort(long address, short value) {
+        MEM.set(SHORT_LE, address, value);
+    }
+
+    private static void putInt(long address, int value) {
+        MEM.set(INT_LE, address, value);
+    }
+
+    private static void putLong(long address, long value) {
+        MEM.set(LONG_LE, address, value);
+    }
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     public static void main(String[] args) throws Exception {
         long start = System.currentTimeMillis();
@@ -110,12 +157,13 @@ public class CalculateAverage_serkan_ozal {
 
         int concurrency = USE_VTHREADS ? VTHREAD_COUNT : THREAD_COUNT;
         int regionCount = REGION_COUNT > 0 ? REGION_COUNT : concurrency;
-        ByteBuffer lineBuffer = getByteBuffer(MAX_LINE_LENGTH);
+        ByteBuffer lineBuffer = ByteBuffer.allocateDirect(MAX_LINE_LENGTH);
         Result result = new Result();
 
         RandomAccessFile file = new RandomAccessFile(FILE, "r");
         FileChannel fc = file.getChannel();
-        Arena arena = USE_SHARED_ARENA ? Arena.ofShared() : null;
+        // A single shared arena (the original created one and immediately overwrote it when USE_SHARED_REGION was set)
+        Arena arena = (USE_SHARED_ARENA || USE_SHARED_REGION) ? Arena.ofShared() : null;
         try {
             long fileSize = fc.size();
             long regionSize = fileSize / regionCount;
@@ -125,13 +173,12 @@ public class CalculateAverage_serkan_ozal {
                     : Executors.newFixedThreadPool(concurrency, new RegionProcessorThreadFactory());
             MemorySegment region = null;
             if (USE_SHARED_REGION) {
-                arena = Arena.ofShared();
                 region = fc.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, arena);
             }
 
             List<Task> tasks = new ArrayList<>(regionCount);
             // Split whole file into regions and create tasks for each region
-            List<Future<Response>> futures = new ArrayList<>(regionCount);
+            List<Future<Void>> futures = new ArrayList<>(regionCount);
             for (int i = 0; i < regionCount; i++) {
                 long endPos = Math.min(fileSize, startPos + regionSize);
                 // Lines might split into different regions.
@@ -150,12 +197,12 @@ public class CalculateAverage_serkan_ozal {
             for (int i = 0; i < concurrency; i++) {
                 Request request = new Request(arena, sharedTasks, result);
                 RegionProcessor regionProcessor = createRegionProcessor(request);
-                Future<Response> future = executor.submit(regionProcessor);
+                Future<Void> future = executor.submit(regionProcessor);
                 futures.add(future);
             }
 
             // Wait processors to complete
-            for (Future<Response> future : futures) {
+            for (Future<Void> future : futures) {
                 future.get();
             }
 
@@ -209,12 +256,6 @@ public class CalculateAverage_serkan_ozal {
         }
     }
 
-    private static ByteBuffer getByteBuffer(int size) {
-        ByteBuffer bb = ByteBuffer.allocateDirect(size);
-        bb.order(NATIVE_BYTE_ORDER);
-        return bb;
-    }
-
     private static long findClosestLineEnd(FileChannel fc, long endPos, ByteBuffer lineBuffer) throws IOException {
         long lineCheckStartPos = Math.max(0, endPos - MAX_LINE_LENGTH);
         lineBuffer.rewind();
@@ -245,7 +286,7 @@ public class CalculateAverage_serkan_ozal {
     /**
      * Region processor
      */
-    private static class RegionProcessor implements Callable<Response> {
+    private static class RegionProcessor implements Callable<Void> {
 
         private final Arena arena;
         private final Queue<Task> sharedTasks;
@@ -259,13 +300,13 @@ public class CalculateAverage_serkan_ozal {
         }
 
         @Override
-        public Response call() throws Exception {
+        public Void call() throws Exception {
             if (VERBOSE) {
                 System.out.println("[Processor-" + Thread.currentThread().getName() + "] Processing started at " + System.currentTimeMillis());
             }
             try {
                 processRegion();
-                return new Response(map);
+                return null;
             }
             finally {
                 if (VERBOSE) {
@@ -275,7 +316,7 @@ public class CalculateAverage_serkan_ozal {
         }
 
         private void processRegion() throws Exception {
-            // Create map in its own thread
+            // Create map in its own thread (its native memory is owned by, and released from, this thread)
             this.map = new OpenMap();
 
             boolean arenaGiven = arena != null;
@@ -324,6 +365,8 @@ public class CalculateAverage_serkan_ozal {
                 }
             }
             finally {
+                // Release the map's native memory (results have already been merged at this point)
+                map.close();
                 // If local memory arena is managed here and not closed yet, close it here
                 if (!arenaGiven && a != null) {
                     a.close();
@@ -337,7 +380,7 @@ public class CalculateAverage_serkan_ozal {
         private long findClosestLineEnd(long endPos, long minPos) {
             int i = 0;
             int maxI = Math.min(MAX_LINE_LENGTH, (int) (endPos - minPos));
-            while (i <= maxI && U.getByte(endPos - i) != NEW_LINE_SEPARATOR) {
+            while (i <= maxI && getByte(endPos - i) != NEW_LINE_SEPARATOR) {
                 i++;
             }
             return endPos - i + 1;
@@ -390,8 +433,8 @@ public class CalculateAverage_serkan_ozal {
                 long keyStartPtr1 = regionPtr1;
                 long keyStartPtr2 = regionPtr2;
 
-                ByteVector keyVector1 = ByteVector.fromMemorySegment(BYTE_SPECIES, NULL, regionPtr1, NATIVE_BYTE_ORDER);
-                ByteVector keyVector2 = ByteVector.fromMemorySegment(BYTE_SPECIES, NULL, regionPtr2, NATIVE_BYTE_ORDER);
+                ByteVector keyVector1 = ByteVector.fromMemorySegment(BYTE_SPECIES, MEM, regionPtr1, NATIVE_BYTE_ORDER);
+                ByteVector keyVector2 = ByteVector.fromMemorySegment(BYTE_SPECIES, MEM, regionPtr2, NATIVE_BYTE_ORDER);
 
                 int keyLength1 = keyVector1.compare(VectorOperators.EQ, KEY_VALUE_SEPARATOR).firstTrue();
                 int keyLength2 = keyVector2.compare(VectorOperators.EQ, KEY_VALUE_SEPARATOR).firstTrue();
@@ -406,7 +449,7 @@ public class CalculateAverage_serkan_ozal {
                     }
                     else {
                         regionPtr1 += BYTE_SPECIES_SIZE;
-                        for (; U.getByte(regionPtr1) != KEY_VALUE_SEPARATOR; regionPtr1++)
+                        for (; getByte(regionPtr1) != KEY_VALUE_SEPARATOR; regionPtr1++)
                             ;
                         keyLength1 = (int) (regionPtr1 - keyStartPtr1);
                         regionPtr1++;
@@ -416,7 +459,7 @@ public class CalculateAverage_serkan_ozal {
                     }
                     else {
                         regionPtr2 += BYTE_SPECIES_SIZE;
-                        for (; U.getByte(regionPtr2) != KEY_VALUE_SEPARATOR; regionPtr2++)
+                        for (; getByte(regionPtr2) != KEY_VALUE_SEPARATOR; regionPtr2++)
                             ;
                         keyLength2 = (int) (regionPtr2 - keyStartPtr2);
                         regionPtr2++;
@@ -424,39 +467,36 @@ public class CalculateAverage_serkan_ozal {
                 }
 
                 // Read first words as they will be used while extracting values later
-                long word1 = U.getLong(regionPtr1);
-                long word2 = U.getLong(regionPtr2);
-                if (NATIVE_BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-                    word1 = Long.reverseBytes(word1);
-                    word2 = Long.reverseBytes(word2);
-                }
+                // (little-endian by construction, see LONG_LE)
+                long word1 = getLong(regionPtr1);
+                long word2 = getLong(regionPtr2);
                 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
                 // Calculate key hashes and find entry indexes
                 ////////////////////////////////////////////////////////////////////////////////////////////////////////
                 int x1, y1, x2, y2;
                 if (keyLength1 > 3 && keyLength2 > 3) {
-                    x1 = U.getInt(keyStartPtr1);
-                    y1 = U.getInt(regionPtr1 - 5);
-                    x2 = U.getInt(keyStartPtr2);
-                    y2 = U.getInt(regionPtr2 - 5);
+                    x1 = getInt(keyStartPtr1);
+                    y1 = getInt(regionPtr1 - 5);
+                    x2 = getInt(keyStartPtr2);
+                    y2 = getInt(regionPtr2 - 5);
                 }
                 else {
                     if (keyLength1 > 3) {
-                        x1 = U.getInt(keyStartPtr1);
-                        y1 = U.getInt(regionPtr1 - 5);
+                        x1 = getInt(keyStartPtr1);
+                        y1 = getInt(regionPtr1 - 5);
                     }
                     else {
-                        x1 = U.getByte(keyStartPtr1);
-                        y1 = U.getByte(regionPtr1 - 2);
+                        x1 = getByte(keyStartPtr1);
+                        y1 = getByte(regionPtr1 - 2);
                     }
                     if (keyLength2 > 3) {
-                        x2 = U.getInt(keyStartPtr2);
-                        y2 = U.getInt(regionPtr2 - 5);
+                        x2 = getInt(keyStartPtr2);
+                        y2 = getInt(regionPtr2 - 5);
                     }
                     else {
-                        x2 = U.getByte(keyStartPtr2);
-                        y2 = U.getByte(regionPtr2 - 2);
+                        x2 = getByte(keyStartPtr2);
+                        y2 = getByte(regionPtr2 - 2);
                     }
                 }
 
@@ -487,46 +527,40 @@ public class CalculateAverage_serkan_ozal {
         private void doProcessTail(long regionPtr1, long regionEnd1, long regionPtr2, long regionEnd2) {
             while (regionPtr1 < regionEnd1) {
                 long keyStartPtr1 = regionPtr1;
-                ByteVector keyVector1 = ByteVector.fromMemorySegment(BYTE_SPECIES, NULL, regionPtr1, NATIVE_BYTE_ORDER);
+                ByteVector keyVector1 = ByteVector.fromMemorySegment(BYTE_SPECIES, MEM, regionPtr1, NATIVE_BYTE_ORDER);
                 int keyLength1 = keyVector1.compare(VectorOperators.EQ, KEY_VALUE_SEPARATOR).firstTrue();
                 if (keyLength1 != BYTE_SPECIES_SIZE) {
                     regionPtr1 += (keyLength1 + 1);
                 }
                 else {
                     regionPtr1 += BYTE_SPECIES_SIZE;
-                    for (; U.getByte(regionPtr1) != KEY_VALUE_SEPARATOR; regionPtr1++)
+                    for (; getByte(regionPtr1) != KEY_VALUE_SEPARATOR; regionPtr1++)
                         ;
                     keyLength1 = (int) (regionPtr1 - keyStartPtr1);
                     regionPtr1++;
                 }
                 int entryIdx1 = map.calculateEntryIndex(keyStartPtr1, keyLength1);
                 int entryOffset1 = map.putKey(keyVector1, keyStartPtr1, keyLength1, entryIdx1);
-                long word1 = U.getLong(regionPtr1);
-                if (NATIVE_BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-                    word1 = Long.reverseBytes(word1);
-                }
+                long word1 = getLong(regionPtr1);
                 regionPtr1 = extractValue(regionPtr1, word1, map, entryOffset1);
             }
             while (regionPtr2 < regionEnd2) {
                 long keyStartPtr2 = regionPtr2;
-                ByteVector keyVector2 = ByteVector.fromMemorySegment(BYTE_SPECIES, NULL, regionPtr2, NATIVE_BYTE_ORDER);
+                ByteVector keyVector2 = ByteVector.fromMemorySegment(BYTE_SPECIES, MEM, regionPtr2, NATIVE_BYTE_ORDER);
                 int keyLength2 = keyVector2.compare(VectorOperators.EQ, KEY_VALUE_SEPARATOR).firstTrue();
                 if (keyLength2 != BYTE_SPECIES_SIZE) {
                     regionPtr2 += (keyLength2 + 1);
                 }
                 else {
                     regionPtr2 += BYTE_SPECIES_SIZE;
-                    for (; U.getByte(regionPtr2) != KEY_VALUE_SEPARATOR; regionPtr2++)
+                    for (; getByte(regionPtr2) != KEY_VALUE_SEPARATOR; regionPtr2++)
                         ;
                     keyLength2 = (int) (regionPtr2 - keyStartPtr2);
                     regionPtr2++;
                 }
                 int entryIdx2 = map.calculateEntryIndex(keyStartPtr2, keyLength2);
                 int entryOffset2 = map.putKey(keyVector2, keyStartPtr2, keyLength2, entryIdx2);
-                long word2 = U.getLong(regionPtr2);
-                if (NATIVE_BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-                    word2 = Long.reverseBytes(word2);
-                }
+                long word2 = getLong(regionPtr2);
                 regionPtr2 = extractValue(regionPtr2, word2, map, entryOffset2);
             }
         }
@@ -572,19 +606,6 @@ public class CalculateAverage_serkan_ozal {
     }
 
     /**
-     * Region processor response
-     */
-    private static final class Response {
-
-        private final OpenMap map;
-
-        private Response(OpenMap map) {
-            this.map = map;
-        }
-
-    }
-
-    /**
      * Result of each key (city)
      */
     private static final class KeyResult {
@@ -610,7 +631,8 @@ public class CalculateAverage_serkan_ozal {
 
         @Override
         public String toString() {
-            return (minValue / 10.0) + "/" + round(sum / (double) (count * 10)) + "/" + (maxValue / 10.0);
+            // "count * 10.0" (not "count * 10") to avoid int overflow for keys with > ~214M measurements
+            return (minValue / 10.0) + "/" + round(sum / (count * 10.0)) + "/" + (maxValue / 10.0);
         }
 
         private double round(double value) {
@@ -676,9 +698,12 @@ public class CalculateAverage_serkan_ozal {
     }
 
     /**
-     * Custom map implementation to store results
+     * Custom map implementation to store results.
+     * <p>
+     * The table lives in native memory and is addressed as {@code base + entryOffset}, where
+     * {@code entryOffset} is a plain offset in {@code [0, MAP_SIZE)}.
      */
-    private static final class OpenMap {
+    private static final class OpenMap implements AutoCloseable {
 
         // Layout
         // ================================
@@ -706,32 +731,43 @@ public class CalculateAverage_serkan_ozal {
         private static final int ENTRY_HASH_MASK = MAP_CAPACITY - 1;
         private static final int MAP_SIZE = ENTRY_SIZE * MAP_CAPACITY;
         private static final int ENTRY_MASK = MAP_SIZE - 1;
-        private static final int KEY_ARRAY_OFFSET = KEY_OFFSET - Unsafe.ARRAY_BYTE_BASE_OFFSET;
 
         private static final int HASH_SEED = 0x9E3779B9;
         private static final int HASH_ROTATE = 5;
 
-        private final byte[] data;
+        private final Arena arena;
+        private final long base;
         private final int[] entryOffsets;
         private int entryOffsetIdx;
 
         private OpenMap() {
-            this.data = new byte[MAP_SIZE];
+            // Confined: allocated, used and closed by the same (processor) thread.
+            this.arena = Arena.ofConfined();
+            // Entries are 128 bytes (two cache lines), so align the table to the entry size.
+            MemorySegment table = arena.allocate(MAP_SIZE, ENTRY_SIZE);
+            // The "empty slot" check relies on key size == 0, so don't depend on allocator zeroing.
+            table.fill((byte) 0);
+            this.base = table.address();
             // Max number of unique keys are 10K, so 1 << 14 (16384) is long enough to hold offsets for all of them
             this.entryOffsets = new int[1 << 14];
             this.entryOffsetIdx = 0;
+        }
+
+        @Override
+        public void close() {
+            arena.close();
         }
 
         // Credits: merykitty
         private int calculateEntryIndex(long address, int keyLength) {
             int x, y;
             if (keyLength >= Integer.BYTES) {
-                x = U.getInt(address);
-                y = U.getInt(address + keyLength - Integer.BYTES);
+                x = getInt(address);
+                y = getInt(address + keyLength - Integer.BYTES);
             }
             else {
-                x = U.getByte(address);
-                y = U.getByte(address + keyLength - Byte.BYTES);
+                x = getByte(address);
+                y = getByte(address + keyLength - Byte.BYTES);
             }
             // Calculate key hash
             int keyHash = (Integer.rotateLeft(x * HASH_SEED, HASH_ROTATE) ^ y) * HASH_SEED;
@@ -743,101 +779,100 @@ public class CalculateAverage_serkan_ozal {
             // Start searching from the calculated position
             // and continue until find an available slot in case of hash collision
             // TODO Prevent infinite loop if all the slots are in use for other keys
-            for (int entryOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET + entryIdx;; entryOffset = (entryOffset + ENTRY_SIZE) & ENTRY_MASK) {
-                int keySize = U.getInt(data, entryOffset + KEY_SIZE_OFFSET);
+            for (int entryOffset = entryIdx;; entryOffset = (entryOffset + ENTRY_SIZE) & ENTRY_MASK) {
+                long entryAddress = base + entryOffset;
+                int keySize = getInt(entryAddress + KEY_SIZE_OFFSET);
                 // Check whether current index is empty (no another key is inserted yet)
                 if (keySize == 0) {
                     // Initialize entry slot for new key
-                    U.putShort(data, entryOffset + MIN_VALUE_OFFSET, Short.MAX_VALUE);
-                    U.putShort(data, entryOffset + MAX_VALUE_OFFSET, Short.MIN_VALUE);
-                    U.putInt(data, entryOffset + KEY_SIZE_OFFSET, keyLength);
-                    U.copyMemory(null, keyStartAddress, data, entryOffset + KEY_OFFSET, keyLength);
+                    putShort(entryAddress + MIN_VALUE_OFFSET, Short.MAX_VALUE);
+                    putShort(entryAddress + MAX_VALUE_OFFSET, Short.MIN_VALUE);
+                    putInt(entryAddress + KEY_SIZE_OFFSET, keyLength);
+                    MemorySegment.copy(MEM, keyStartAddress, MEM, entryAddress + KEY_OFFSET, keyLength);
                     entryOffsets[entryOffsetIdx++] = entryOffset;
                     return entryOffset;
                 }
                 // Check for hash collision (hashes are same, but keys are different).
                 // If there is no collision (both hashes and keys are equals), return current slot's offset.
                 // Otherwise, continue iterating until find an available slot.
-                if (keySize == keyLength && keysEqual(keyVector, keyStartAddress, keyLength, entryOffset + KEY_ARRAY_OFFSET)) {
+                if (keySize == keyLength && keysEqual(keyVector, keyStartAddress, keyLength, entryAddress + KEY_OFFSET)) {
                     return entryOffset;
                 }
             }
         }
 
-        private boolean keysEqual(ByteVector keyVector, long keyStartAddress, int keyLength, int keyStartArrayOffset) {
+        private boolean keysEqual(ByteVector keyVector, long keyStartAddress, int keyLength, long entryKeyAddress) {
             // Use vectorized search for the comparison of keys.
             // Since majority of the city names >= 8 bytes and <= 16 bytes,
             // this way is more efficient (according to my experiments) than any other comparisons (byte by byte or 2 longs).
-            ByteVector entryKeyVector = ByteVector.fromArray(BYTE_SPECIES, data, keyStartArrayOffset);
+            // Lanes past the end of the key can never match: the file side holds ';', digits, etc. (never 0)
+            // while the map side is zero padded.
+            ByteVector entryKeyVector = ByteVector.fromMemorySegment(BYTE_SPECIES, MEM, entryKeyAddress, NATIVE_BYTE_ORDER);
             int eqCount = keyVector.compare(VectorOperators.EQ, entryKeyVector).trueCount();
-            if (eqCount == keyLength) {
-                return true;
+            if (keyLength <= BYTE_SPECIES_SIZE) {
+                return eqCount == keyLength;
             }
-            else if (keyLength <= BYTE_SPECIES_SIZE) {
+            // Longer keys: the vector must cover the first BYTE_SPECIES_SIZE bytes completely.
+            // (The original did not check this, so two different keys with the same length and the same
+            // bytes after the first vector could have been merged.)
+            if (eqCount != BYTE_SPECIES_SIZE) {
                 return false;
             }
 
             // Compare remaining parts of the keys
 
-            int normalizedKeyLength = keyLength;
-            if (NATIVE_BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-                normalizedKeyLength = Integer.reverseBytes(normalizedKeyLength);
-            }
-
-            long keyStartOffset = keyStartArrayOffset + Unsafe.ARRAY_BYTE_BASE_OFFSET;
-            int alignedKeyLength = normalizedKeyLength & 0xFFFFFFF8;
+            int alignedKeyLength = keyLength & 0xFFFFFFF8;
             int i;
             for (i = BYTE_SPECIES_SIZE; i < alignedKeyLength; i += Long.BYTES) {
-                if (U.getLong(keyStartAddress + i) != U.getLong(data, keyStartOffset + i)) {
+                if (getLong(keyStartAddress + i) != getLong(entryKeyAddress + i)) {
                     return false;
                 }
             }
 
-            long wordA = U.getLong(keyStartAddress + i);
-            long wordB = U.getLong(data, keyStartOffset + i);
-            if (NATIVE_BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-                wordA = Long.reverseBytes(wordA);
-                wordB = Long.reverseBytes(wordB);
-            }
-            int halfShift = (Long.BYTES - (normalizedKeyLength & 0x00000007)) << 2;
-            long mask = (0xFFFFFFFFFFFFFFFFL >>> halfShift) >> halfShift;
+            long wordA = getLong(keyStartAddress + i);
+            long wordB = getLong(entryKeyAddress + i);
+            // Keep only the (keyLength & 7) low bytes. Two shifts, because a single shift by 64 would be a no-op.
+            int halfShift = (Long.BYTES - (keyLength & 0x00000007)) << 2;
+            long mask = (0xFFFFFFFFFFFFFFFFL >>> halfShift) >>> halfShift;
             wordA = wordA & mask;
             // No need to mask "wordB" (word from key in the map), because it is already padded with 0s
             return wordA == wordB;
         }
 
         private void putValue(int entryOffset, int value) {
-            int countOffset = entryOffset + COUNT_OFFSET;
-            int minValueOffset = entryOffset + MIN_VALUE_OFFSET;
-            int maxValueOffset = entryOffset + MAX_VALUE_OFFSET;
-            int sumOffset = entryOffset + VALUE_SUM_OFFSET;
+            long entryAddress = base + entryOffset;
+            long countAddress = entryAddress + COUNT_OFFSET;
+            long minValueAddress = entryAddress + MIN_VALUE_OFFSET;
+            long maxValueAddress = entryAddress + MAX_VALUE_OFFSET;
+            long sumAddress = entryAddress + VALUE_SUM_OFFSET;
 
-            U.putInt(data, countOffset, U.getInt(data, countOffset) + 1);
-            if (value < U.getShort(data, minValueOffset)) {
-                U.putShort(data, minValueOffset, (short) value);
+            putInt(countAddress, getInt(countAddress) + 1);
+            if (value < getShort(minValueAddress)) {
+                putShort(minValueAddress, (short) value);
             }
-            if (value > U.getShort(data, maxValueOffset)) {
-                U.putShort(data, maxValueOffset, (short) value);
+            if (value > getShort(maxValueAddress)) {
+                putShort(maxValueAddress, (short) value);
             }
-            U.putLong(data, sumOffset, U.getLong(data, sumOffset) + value);
+            putLong(sumAddress, getLong(sumAddress) + value);
         }
 
         private void merge(Map<String, KeyResult> resultMap) {
             // Merge this local map into global result map
             Arrays.sort(entryOffsets, 0, entryOffsetIdx);
             for (int i = 0; i < entryOffsetIdx; i++) {
-                int entryOffset = entryOffsets[i];
-                int keyLength = U.getInt(data, entryOffset + KEY_SIZE_OFFSET);
+                long entryAddress = base + entryOffsets[i];
+                int keyLength = getInt(entryAddress + KEY_SIZE_OFFSET);
                 if (keyLength == 0) {
                     // No entry is available for this index, so continue iterating
                     continue;
                 }
-                int entryArrayIdx = entryOffset + KEY_OFFSET - Unsafe.ARRAY_BYTE_BASE_OFFSET;
-                String key = new String(data, entryArrayIdx, keyLength, StandardCharsets.UTF_8);
-                int count = U.getInt(data, entryOffset + COUNT_OFFSET);
-                short minValue = U.getShort(data, entryOffset + MIN_VALUE_OFFSET);
-                short maxValue = U.getShort(data, entryOffset + MAX_VALUE_OFFSET);
-                long sum = U.getLong(data, entryOffset + VALUE_SUM_OFFSET);
+                byte[] keyBytes = new byte[keyLength];
+                MemorySegment.copy(MEM, ValueLayout.JAVA_BYTE, entryAddress + KEY_OFFSET, keyBytes, 0, keyLength);
+                String key = new String(keyBytes, StandardCharsets.UTF_8);
+                int count = getInt(entryAddress + COUNT_OFFSET);
+                short minValue = getShort(entryAddress + MIN_VALUE_OFFSET);
+                short maxValue = getShort(entryAddress + MAX_VALUE_OFFSET);
+                long sum = getLong(entryAddress + VALUE_SUM_OFFSET);
                 KeyResult result = new KeyResult(count, minValue, maxValue, sum);
                 KeyResult existingResult = resultMap.get(key);
                 if (existingResult == null) {

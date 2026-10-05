@@ -15,71 +15,85 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.io.IOException;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.TreeMap;
 
+/**
+ * Java 22+ (tested design target: Java 27) version. No sun.misc.Unsafe:
+ * - the input file is accessed through the (final) java.lang.foreign API,
+ * - the per-thread hash table is a plain long[] (4 longs per entry).
+ *
+ * The parsing logic assumes little-endian byte order, so all 8-byte reads
+ * explicitly use a little-endian layout (a no-op on x86-64 / AArch64).
+ */
 public class CalculateAverage_gigiblender {
     private static final int AVAIL_CORES = Runtime.getRuntime().availableProcessors();
     private static final HashTable[] tables = new HashTable[AVAIL_CORES];
 
-    private static Unsafe unsafe;
-    static {
-        Field theUnsafe = null;
-        try {
-            theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            unsafe = (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (IllegalAccessException | NoSuchFieldException ignored) {
-        }
-    }
+    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
 
     private static final String FILE = "./measurements.txt";
 
+    private static final long HASH_SEED = -2346162244362633811L;
+
+    /**
+     * Reads 8 bytes at {@code offset}. Unlike the old Unsafe code, a MemorySegment
+     * is bounds-checked, so near the end of the file we assemble the value from the
+     * bytes that exist and pad with zeros. Zero padding is safe: none of the byte
+     * searches below (';', '.', '\n') can produce a false match on a 0x00 byte.
+     */
+    private static long readLong(MemorySegment file, long offset) {
+        if (offset <= file.byteSize() - Long.BYTES) {
+            return file.get(LONG_LE, offset);
+        }
+        return readLongSlow(file, offset);
+    }
+
+    private static long readLongSlow(MemorySegment file, long offset) {
+        long size = file.byteSize();
+        long v = 0;
+        for (int i = 0; i < Long.BYTES && offset + i < size; i++) {
+            v |= (file.get(BYTE, offset + i) & 0xFFL) << (i * Byte.SIZE);
+        }
+        return v;
+    }
+
     static class HashTable {
 
-        // 10_000 unique hashes ->
-        private static final int ENTRY_SIZE = 32;
+        // 10_000 unique keys -> 16384 slots
+        private static final int ENTRY_LONGS = 4;
         private static final int NUM_ENTRIES = 16384;
-        private static final int DATA_SIZE = NUM_ENTRIES * ENTRY_SIZE;
+        private static final int ENTRY_MASK = NUM_ENTRIES - 1;
 
         /*
-         * data[i -> i + 7] = 8 bytes hash
-         * data[i + 8 -> i + 15] = 7 bytes masked address of the string in the file. 1 byte for the length of the string
-         * data[i + 16 -> i + 19] = 4 bytes count
-         * data[i + 20 -> i + 21] = 2 bytes max
-         * data[i + 22 -> i + 23] = 2 bytes min -- sign preserved
-         * data[i + 24 -> i + 31] = 8 bytes sum
+         * Entry layout (4 longs = 32 bytes), indices relative to the entry start:
+         * [0] 8 bytes hash
+         * [1] low 7 bytes: offset of the string in the file, high byte: length of the string
+         * [2] low 4 bytes count, then 2 bytes max, then 2 bytes min (sign preserved)
+         * [3] 8 bytes sum
          */
-        byte[] data;
+        private static final int HASH_SLOT = 0;
+        private static final int ADDR_SLOT = 1;
+        private static final int CMM_SLOT = 2;
+        private static final int SUM_SLOT = 3;
 
-        private static final int HASH_OFFSET = 0;
-
-        private static final int ADDR_OFFSET = 8;
         private static final long ADDR_MASK = 0x00FFFFFFFFFFFFFFL;
         private static final int STRING_LENGTH_SHIFT = 56;
 
-        private static final int COUNT_OFFSET = 16;
+        private final MemorySegment file;
+        private final long[] data = new long[NUM_ENTRIES * ENTRY_LONGS];
 
-        private static final int SUM_OFFSET = 24;
-
-        private int reprobe_count;
-
-        public HashTable() {
-            data = new byte[DATA_SIZE];
-            // reprobe_count = 0;
-        }
-
-        private long string_addr_and_length(long hash) {
-            return unsafe.getLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + hash + ADDR_OFFSET);
+        public HashTable(MemorySegment file) {
+            this.file = file;
         }
 
         private static long string_addr(long encoded_str_addr) {
@@ -88,10 +102,6 @@ public class CalculateAverage_gigiblender {
 
         private static long string_length(long encoded_str_addr) {
             return encoded_str_addr >>> STRING_LENGTH_SHIFT;
-        }
-
-        private long count_max_min(long hash) {
-            return unsafe.getLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + hash + COUNT_OFFSET);
         }
 
         private static short mask_min(long count_max_min) {
@@ -108,144 +118,87 @@ public class CalculateAverage_gigiblender {
         }
 
         private static long encode_count_max_min(int count, short max, short min) {
-            return ((long) count) | ((((long) max) & 0xFFFF) << 4 * Byte.SIZE) | (((long) min) << 6 * Byte.SIZE);
+            return (count & 0xFFFFFFFFL) | ((((long) max) & 0xFFFF) << 4 * Byte.SIZE) | (((long) min) << 6 * Byte.SIZE);
         }
 
-        private long sum(long hash) {
-            return unsafe.getLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + hash + SUM_OFFSET);
-        }
-
-        private static boolean string_equals(long string_addr, long entry_string_addr, int size_bytes) {
-            int remaining_bytes = size_bytes % 8;
+        private static boolean string_equals(MemorySegment file, long string_addr, long entry_string_addr, int size_bytes) {
+            int remaining_bytes = size_bytes & 7;
             int i = 0;
             for (; i < size_bytes - remaining_bytes; i += 8) {
-                long entry_bytes = unsafe.getLong(entry_string_addr + i);
-                long string_bytes = unsafe.getLong(string_addr + i);
-                if (entry_bytes != string_bytes) {
+                if (file.get(LONG_LE, entry_string_addr + i) != file.get(LONG_LE, string_addr + i)) {
                     return false;
                 }
             }
-            // The hash function is not great, so I end up in this case a lot, so I take some risks.
-            // This never caused a SIGSEGV even though it might :) If it does, fall back to the commented version below.
-            // I will try to improve on the hash function
             if (remaining_bytes != 0) {
-                long entry_bytes = unsafe.getLong(entry_string_addr + i);
-                long string_bytes = unsafe.getLong(string_addr + i);
-                // mask the bytes we care about
+                // Read a full word and mask the bytes we care about. readLong() makes this
+                // safe even when the string is within the last 8 bytes of the file.
+                long entry_bytes = readLong(file, entry_string_addr + i);
+                long string_bytes = readLong(file, string_addr + i);
                 long mask = (1L << (remaining_bytes * Byte.SIZE)) - 1;
-                entry_bytes &= mask;
-                string_bytes &= mask;
-                return entry_bytes == string_bytes;
+                return ((entry_bytes ^ string_bytes) & mask) == 0;
             }
-            // for (; i < size_bytes; i++) {
-            // byte entry_byte = unsafe.getByte(entry_string_addr + i);
-            // byte string_byte = unsafe.getByte(string_addr + i);
-            // if (entry_byte != string_byte) {
-            // return false;
-            // }
-            // }
             return true;
         }
 
-        public void insert(long hash, long string_addr, byte string_size, long final_number) {
+        public void insert(long hash, long string_addr, int string_size, long final_number) {
             assert string_addr >>> 56 == 0 : String.format("Expected final 8 bytes to be 0, got %s", Long.toBinaryString(string_addr));
+            assert string_size > 0 && string_size < 256 : "String length must fit in one byte, got " + string_size;
 
             long encoded_string_addr_and_length = string_addr | ((long) string_size << STRING_LENGTH_SHIFT);
-            assert string_addr(encoded_string_addr_and_length) == string_addr : String.format("Expected string addr to be %s, got %s", Long.toHexString(string_addr),
-                    Long.toHexString(string_addr(encoded_string_addr_and_length)));
-            assert string_length(encoded_string_addr_and_length) == string_size
-                    : String.format("Expected string length to be %s, got %s", string_size, string_length(encoded_string_addr_and_length));
+            assert string_addr(encoded_string_addr_and_length) == string_addr;
+            assert string_length(encoded_string_addr_and_length) == string_size;
 
-            long map_entry = apply_mask(hash * ENTRY_SIZE);
+            final long[] data = this.data;
+            int slot = (int) (hash & ENTRY_MASK);
             while (true) {
-                int entry_count0 = unsafe.getInt(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + COUNT_OFFSET);
-                if (entry_count0 == 0) {
-                    // dump_insert(map_entry, hash, string_addr, string_size, final_number);
+                int base = slot * ENTRY_LONGS;
+                long entry_count_max_min = data[base + CMM_SLOT];
+                if (mask_count(entry_count_max_min) == 0) {
                     // Found an empty slot. Insert the entry here
-                    unsafe.putLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + HASH_OFFSET, hash);
-                    unsafe.putLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + ADDR_OFFSET, encoded_string_addr_and_length);
-                    unsafe.putLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + COUNT_OFFSET, encode_count_max_min(1, (short) final_number, (short) final_number));
-                    unsafe.putLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + SUM_OFFSET, final_number);
-
-                    assert mask_count(encode_count_max_min(1, (short) final_number, (short) final_number)) == 1 : String.format("Expected count to be 1, got %s",
-                            Integer.toBinaryString(mask_count(encode_count_max_min(1, (short) final_number, (short) final_number))));
-                    assert mask_max(encode_count_max_min(1, (short) final_number, (short) final_number)) == (short) final_number
-                            : String.format("Expected max to be %s, got %s", final_number,
-                                    Integer.toBinaryString(mask_max(encode_count_max_min(1, (short) final_number, (short) final_number))));
-                    assert mask_min(encode_count_max_min(1, (short) final_number, (short) final_number)) == (short) final_number
-                            : String.format("Expected min to be %s, got %s", final_number,
-                                    Integer.toBinaryString(mask_min(encode_count_max_min(1, (short) final_number, (short) final_number))));
+                    data[base + HASH_SLOT] = hash;
+                    data[base + ADDR_SLOT] = encoded_string_addr_and_length;
+                    data[base + CMM_SLOT] = encode_count_max_min(1, (short) final_number, (short) final_number);
+                    data[base + SUM_SLOT] = final_number;
                     return;
                 }
-                else {
-                    // Check if strings match. If yes, update. Otherwise, look for the next available slot
-                    long entry_string_addr_and_length = string_addr_and_length(map_entry);
-                    long entry_str_size = string_length(entry_string_addr_and_length);
 
-                    if (string_size != entry_str_size) {
-                        // Strings are not the same size. Continue looking for the next slot
-                        map_entry = apply_mask(map_entry + ENTRY_SIZE);
-                        // reprobe_count++;
-                    }
-                    else {
-                        long entry_string_addr = string_addr(entry_string_addr_and_length);
-                        if (string_equals(string_addr, entry_string_addr, string_size)) {
-                            // Strings are the same. Update the entry
-                            long entry_count_max_min = count_max_min(map_entry);
-                            int entry_count = mask_count(entry_count_max_min);
-                            short entry_max = mask_max(entry_count_max_min);
-                            short entry_min = mask_min(entry_count_max_min);
+                // Check if strings match. If yes, update. Otherwise, look for the next available slot
+                long entry_string_addr_and_length = data[base + ADDR_SLOT];
+                if (string_length(entry_string_addr_and_length) == string_size
+                        && string_equals(file, string_addr, string_addr(entry_string_addr_and_length), string_size)) {
+                    int entry_count = mask_count(entry_count_max_min) + 1;
+                    short entry_max = (short) Math.max(mask_max(entry_count_max_min), (int) final_number);
+                    short entry_min = (short) Math.min(mask_min(entry_count_max_min), (int) final_number);
 
-                            entry_count++;
-                            assert (int) final_number == final_number : String.format("Expected final number to be an int, got %s", final_number);
-                            entry_max = (short) Math.max(entry_max, (int) final_number);
-                            entry_min = (short) Math.min(entry_min, (int) final_number);
-
-                            long entry_sum = sum(map_entry);
-                            entry_sum += final_number;
-
-                            unsafe.putLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + COUNT_OFFSET, encode_count_max_min(entry_count, entry_max, entry_min));
-                            unsafe.putLong(data, Unsafe.ARRAY_BYTE_BASE_OFFSET + map_entry + SUM_OFFSET, entry_sum);
-                            return;
-                        }
-                        else {
-                            // Strings are not the same. Continue looking for the next slot
-                            map_entry = apply_mask(map_entry + ENTRY_SIZE);
-                            // reprobe_count++;
-                        }
-                    }
+                    data[base + CMM_SLOT] = encode_count_max_min(entry_count, entry_max, entry_min);
+                    data[base + SUM_SLOT] += final_number;
+                    return;
                 }
+                slot = (slot + 1) & ENTRY_MASK;
             }
         }
 
-        private static long apply_mask(long hash) {
-            return hash & (DATA_SIZE - 1);
-        }
-
         public void update_res(TreeMap<String, Result> result_map) {
-            // System.err.println("Reprobe count: " + reprobe_count);
             Result r = new Result();
 
             for (int i = 0; i < NUM_ENTRIES; i++) {
-                long entry_addr_offset = (long) i * ENTRY_SIZE;
-                long entry_count_max_min = count_max_min(entry_addr_offset);
+                int base = i * ENTRY_LONGS;
+                long entry_count_max_min = data[base + CMM_SLOT];
                 int entry_count = mask_count(entry_count_max_min);
                 if (entry_count == 0) {
                     continue;
                 }
-                long entry_string_addr_and_length = string_addr_and_length(entry_addr_offset);
+                long entry_string_addr_and_length = data[base + ADDR_SLOT];
                 long entry_string_addr = string_addr(entry_string_addr_and_length);
-                long entry_string_length = string_length(entry_string_addr_and_length);
+                int entry_string_length = (int) string_length(entry_string_addr_and_length);
 
-                // no reason to copy the byte array twice here but what can you do...
-                byte[] bytes = new byte[(int) entry_string_length];
-                unsafe.copyMemory(null, entry_string_addr, bytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, entry_string_length);
+                byte[] bytes = new byte[entry_string_length];
+                MemorySegment.copy(file, BYTE, entry_string_addr, bytes, 0, entry_string_length);
                 String s = new String(bytes, StandardCharsets.UTF_8);
 
                 short entry_max = mask_max(entry_count_max_min);
                 short entry_min = mask_min(entry_count_max_min);
-
-                long entry_sum = sum(entry_addr_offset);
+                long entry_sum = data[base + SUM_SLOT];
 
                 Result ret = result_map.putIfAbsent(s, r);
                 if (ret == null) {
@@ -264,12 +217,12 @@ public class CalculateAverage_gigiblender {
             }
         }
 
-        public void dump_insert(long map_entry, long hash, long string_addr, byte string_size, long final_number) {
+        public void dump_insert(long map_entry, long hash, long string_addr, int string_size, long final_number) {
             System.out.println("START dump_insert");
             System.out.println("Inserting " + final_number + " with hash " + hash);
             System.out.println("Map entry: " + map_entry);
             System.out.println("String addr: " + string_addr + " with length " + string_size);
-            dump(string_addr, string_addr + string_size);
+            dump(file, string_addr, string_addr + string_size);
             System.out.println("END dump_insert");
         }
     }
@@ -290,52 +243,51 @@ public class CalculateAverage_gigiblender {
         }
     }
 
-    private static void compute_slice(final long base_addr, final long slice_size, final long file_size, final int thread_index) {
+    private static void compute_slice(final MemorySegment file, final long slice_size, final long file_size, final int thread_index) {
         HashTable my_table;
         if (!SINGLE_CORE) {
-            my_table = new HashTable();
+            my_table = new HashTable(file);
             tables[thread_index] = my_table;
         }
         else {
             if (tables[0] == null) {
-                tables[0] = new HashTable();
+                tables[0] = new HashTable(file);
             }
             my_table = tables[0];
         }
 
-        long cur_addr = base_addr + (long) thread_index * slice_size;
+        // All "addresses" below are byte offsets into the mapped file segment.
+        long cur_addr = (long) thread_index * slice_size;
         // Lookup the next newline. If thread_index == 0 then start right away
         if (thread_index != 0) {
-            while (unsafe.getByte(cur_addr) != '\n') {
+            while (file.get(BYTE, cur_addr) != '\n') {
                 cur_addr++;
             }
             cur_addr++;
         }
 
-        long end_addr = base_addr + (long) (thread_index + 1) * slice_size;
+        long end_addr = (long) (thread_index + 1) * slice_size;
         if (thread_index == (AVAIL_CORES - 1)) {
             // Last thread. We need to read until the end of the file
-            end_addr = base_addr + file_size;
+            end_addr = file_size;
         }
         else {
             // look ahead for the next newline
-            while (unsafe.getByte(end_addr) != '\n') {
+            while (file.get(BYTE, end_addr) != '\n') {
                 end_addr++;
             }
             end_addr++;
         }
 
         // We now have a well-defined interval [cur_addr, end_addr) to work on
-        long hash = -2346162244362633811L;
-        byte string_size = 0;
+        long hash = HASH_SEED;
+        int string_size = 0;
         long string_addr = cur_addr;
         while (cur_addr < end_addr) {
-            long value_mem = unsafe.getLong(cur_addr);
+            long value_mem = readLong(file, cur_addr);
             int semicolon_byte_index = get_semicolon_index(value_mem);
 
-            string_size += (byte) semicolon_byte_index;
-
-            // dump(cur_addr, cur_addr + semicolon_byte_index);
+            string_size += semicolon_byte_index;
 
             if (semicolon_byte_index != 8) {
                 long value_mem_up_to_semicolon = value_mem & ((1L << (semicolon_byte_index * Byte.SIZE)) - 1);
@@ -346,18 +298,17 @@ public class CalculateAverage_gigiblender {
 
                 // Always read the next 8 bytes for the number. It seems that this is faster than
                 // checking if the whole number is in the current 8 bytes and only reading if it is not
-                long number_mem_value = unsafe.getLong(start_num_addr);
+                long number_mem_value = readLong(file, start_num_addr);
                 long number_len_bytes = get_newline_index(number_mem_value);
 
                 long final_number = extract_number(number_mem_value, number_len_bytes);
 
-                // 0.2421196 % reprobe rate
                 hash = compute_hash(hash ^ value_mem_up_to_semicolon);
 
                 // We have the final number now. We can insert it into the hash table
                 my_table.insert(hash, string_addr, string_size, final_number);
                 // Now we can move on to the next line
-                hash = -2346162244362633811L;
+                hash = HASH_SEED;
                 string_size = 0;
                 cur_addr = start_num_addr + number_len_bytes + 1;
                 string_addr = cur_addr;
@@ -418,9 +369,9 @@ public class CalculateAverage_gigiblender {
         return h1 ^ h;
     }
 
-    private static void dump(long startAddr, long endAddr) {
+    private static void dump(MemorySegment file, long startAddr, long endAddr) {
         byte[] bytes = new byte[(int) (endAddr - startAddr)];
-        unsafe.copyMemory(null, startAddr, bytes, Unsafe.ARRAY_BYTE_BASE_OFFSET, bytes.length);
+        MemorySegment.copy(file, BYTE, startAddr, bytes, 0, bytes.length);
         String s = new String(bytes, StandardCharsets.UTF_8);
         System.out.println(s);
         // Dump the bytes to binary form
@@ -460,20 +411,25 @@ public class CalculateAverage_gigiblender {
 
     private static final boolean SINGLE_CORE = false;
 
+    private static MemorySegment map_file() throws IOException {
+        // The mapping stays valid after the channel is closed; Arena.global() keeps it alive
+        // for the lifetime of the process and makes it accessible from every thread.
+        try (FileChannel file_channel = FileChannel.open(Paths.get(FILE), StandardOpenOption.READ)) {
+            return file_channel.map(FileChannel.MapMode.READ_ONLY, 0, file_channel.size(), Arena.global());
+        }
+    }
+
     public static void main(String[] args) throws IOException, InterruptedException {
-        FileChannel file_channel = FileChannel.open(Paths.get(FILE), StandardOpenOption.READ);
-        long file_size = file_channel.size();
-        long base_addr = file_channel.map(FileChannel.MapMode.READ_ONLY, 0, file_size, Arena.global()).address();
+        final MemorySegment file = map_file();
+        final long file_size = file.byteSize();
+        final long slice_size = file_size / AVAIL_CORES;
 
         if (!SINGLE_CORE) {
             int num_threads = AVAIL_CORES;
             Thread[] threads = new Thread[num_threads];
             for (int i = 0; i < num_threads; i++) {
                 int finalI = i;
-                threads[i] = new Thread(() -> {
-                    long slice_size = file_size / AVAIL_CORES;
-                    compute_slice(base_addr, slice_size, file_size, finalI);
-                });
+                threads[i] = new Thread(() -> compute_slice(file, slice_size, file_size, finalI));
                 threads[i].start();
             }
 
@@ -487,9 +443,7 @@ public class CalculateAverage_gigiblender {
         }
         else {
             for (int i = 0; i < AVAIL_CORES; i++) {
-                int finalI = i;
-                long slice_size = file_size / AVAIL_CORES;
-                compute_slice(base_addr, slice_size, file_size, finalI);
+                compute_slice(file, slice_size, file_size, i);
             }
 
             TreeMap<String, Result> result_map = new TreeMap<>();

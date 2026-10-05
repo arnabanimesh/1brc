@@ -15,40 +15,43 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
+import java.io.FileDescriptor;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.lang.foreign.Arena;
-import java.lang.reflect.Field;
-import java.nio.MappedByteBuffer;
+import java.lang.foreign.MemorySegment;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.nio.file.StandardOpenOption.READ;
 
+/**
+ * Java 22+ (tested on JDK 27). Uses only the standard Foreign Function & Memory API
+ * (java.lang.foreign, final since JDK 22) instead of sun.misc.Unsafe, whose memory-access
+ * methods are deprecated for removal (JEP 471) and warn at run time (JEP 498).
+ * <p>
+ * Nothing here is a "restricted" FFM method (no reinterpret(), no Linker), so no
+ * --enable-native-access flag is needed either.
+ */
 public class CalculateAverage_EduardoSaverin {
     private static final Path FILE = Path.of("./measurements.txt");
     private static final int NO_OF_THREADS = Runtime.getRuntime().availableProcessors();
-    private static final Unsafe UNSAFE = initUnsafe();
     private static final int FNV_32_OFFSET = 0x811c9dc5;
     private static final int FNV_32_PRIME = 0x01000193;
+    private static final int MAX_NAME_LENGTH = 100;
     private static final Map<String, ResultRow> resultRowMap = new HashMap<>();
     private static final Lock lock = new ReentrantLock();
-
-    private static Unsafe initUnsafe() {
-        try {
-            Field theUnsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            theUnsafe.setAccessible(true);
-            return (Unsafe) theUnsafe.get(Unsafe.class);
-        }
-        catch (NoSuchFieldException | IllegalAccessException e) {
-            throw new RuntimeException(e);
-        }
-    }
 
     public record Chunk(long start, long length) {
     }
@@ -69,6 +72,7 @@ public class CalculateAverage_EduardoSaverin {
             this.count = 1;
         }
 
+        @Override
         public String toString() {
             return round(min) + "/" + round(sum / count) + "/" + round(max);
         }
@@ -79,120 +83,68 @@ public class CalculateAverage_EduardoSaverin {
     }
 
     /**
-     * 0xA - Represents New Line
-     *
-     * @param fileChannel
-     * @return
-     * @throws IOException
+     * Splits the file into at most NO_OF_THREADS chunks, each ending right after a '\n'
+     * (0xA) so no line is ever split between two threads.
      */
-    static List<Chunk> getChunks(FileChannel fileChannel) throws IOException {
-        int numThreads = 1;
-        if (fileChannel.size() > 64000) {
-            numThreads = NO_OF_THREADS;
+    static List<Chunk> getChunks(MemorySegment file) {
+        final long fileBytes = file.byteSize();
+        final List<Chunk> chunks = new ArrayList<>();
+        if (fileBytes == 0) {
+            return chunks;
         }
-        final long fileBytes = fileChannel.size();
-        final long chunkSize = fileBytes / numThreads;
-        final List<Chunk> chunks = new ArrayList<>(numThreads);
-        final long mappedAddress = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileBytes, Arena.global()).address();
+        final int numThreads = fileBytes > 64000 ? NO_OF_THREADS : 1;
+        final long chunkSize = (fileBytes + numThreads - 1) / numThreads; // round up
+
         long chunkStart = 0;
-        // Ensures that the chunk size does not exceed the remaining bytes in the file.
-        long chunkLength = Math.min(fileBytes - chunkStart - 1, chunkSize);
         while (chunkStart < fileBytes) {
-            MappedByteBuffer mappedByteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, chunkStart + chunkLength,
-                    Math.min(Math.min(fileBytes - chunkStart - chunkLength, chunkLength), 100));
-            // Until \n found
-            while (mappedByteBuffer.get() != 0xA) {
-                chunkLength++;
+            long chunkEnd = Math.min(chunkStart + chunkSize, fileBytes);
+            // Extend until the chunk ends just after a newline (or at EOF)
+            while (chunkEnd < fileBytes && file.get(JAVA_BYTE, chunkEnd - 1) != 0xA) {
+                chunkEnd++;
             }
-            chunks.add(new Chunk(mappedAddress + chunkStart, chunkLength + 1));
-            chunkStart += (chunkLength + 1);
-            chunkLength = Math.min(fileBytes - chunkStart - 1, chunkSize);
+            chunks.add(new Chunk(chunkStart, chunkEnd - chunkStart));
+            chunkStart = chunkEnd;
         }
         return chunks;
     }
 
     static class SimplerHashMap {
-        final int MAPSIZE = 65536;
+        static final int MAPSIZE = 65536; // must be a power of two
+        static final int MASK = MAPSIZE - 1;
         final ResultRow[] slots = new ResultRow[MAPSIZE];
         final byte[][] keys = new byte[MAPSIZE][];
 
-        public void putOrMerge(final byte[] key, final short length, final int hash, final int temp) {
-            int slot = hash;
-            ResultRow slotValue;
+        public void putOrMerge(final byte[] key, final int length, final int hash, final int temp) {
+            int slot = hash & MASK;
 
-            // Doing Linear Probing if Collision
-            while ((slotValue = slots[slot]) != null && (keys[slot].length != length || !unsafeEquals(keys[slot], key, length))) {
-                slot++;
-            }
+            // Linear probing on collision, wrapping around at the end of the table
+            while (true) {
+                final ResultRow slotValue = slots[slot];
 
-            // Existing Key
-            if (slotValue != null) {
-                slotValue.min = Math.min(slotValue.min, temp);
-                slotValue.max = Math.max(slotValue.max, temp);
-                slotValue.sum += temp;
-                slotValue.count++;
-                return;
-            }
-
-            // New Key
-            slots[slot] = new ResultRow(temp);
-            byte[] bytes = new byte[length];
-            System.arraycopy(key, 0, bytes, 0, length);
-            keys[slot] = bytes;
-        }
-
-        static boolean unsafeEquals(final byte[] a, final byte[] b, final short length) {
-            // byte by byte comparisons are slow, so do as big chunks as possible
-            final int baseOffset = Unsafe.ARRAY_BYTE_BASE_OFFSET;
-
-            short i = 0;
-            // Double
-            for (; i < (length & -8); i += 8) {
-                if (UNSAFE.getDouble(a, i + baseOffset) != UNSAFE.getDouble(b, i + baseOffset)) {
-                    return false;
+                // New key
+                if (slotValue == null) {
+                    slots[slot] = new ResultRow(temp);
+                    keys[slot] = Arrays.copyOf(key, length);
+                    return;
                 }
-            }
 
-            // Long
-            for (; i < (length & -8); i += 8) {
-                if (UNSAFE.getLong(a, i + baseOffset) != UNSAFE.getLong(b, i + baseOffset)) {
-                    return false;
+                // Existing key (Arrays.equals on ranges is a vectorized JDK intrinsic)
+                final byte[] slotKey = keys[slot];
+                if (slotKey.length == length && Arrays.equals(slotKey, 0, length, key, 0, length)) {
+                    slotValue.min = Math.min(slotValue.min, temp);
+                    slotValue.max = Math.max(slotValue.max, temp);
+                    slotValue.sum += temp;
+                    slotValue.count++;
+                    return;
                 }
-            }
-            if (i == length) {
-                return true;
-            }
-            // Int
-            for (; i < (length - i & -4); i += 4) {
-                if (UNSAFE.getInt(a, i + baseOffset) != UNSAFE.getInt(b, i + baseOffset)) {
-                    return false;
-                }
-            }
-            if (i == length) {
-                return true;
-            }
-            // Short
-            for (; i < (length - i & -2); i += 2) {
-                if (UNSAFE.getShort(a, i + baseOffset) != UNSAFE.getShort(b, i + baseOffset)) {
-                    return false;
-                }
-            }
-            if (i == length) {
-                return true;
-            }
-            // Byte
-            for (; i < (length - i); i++) {
-                if (UNSAFE.getByte(a, i + baseOffset) != UNSAFE.getByte(b, i + baseOffset)) {
-                    return false;
-                }
-            }
 
-            return true;
+                slot = (slot + 1) & MASK;
+            }
         }
 
         // Get all pairs
         public List<MapEntry> getAll() {
-            final List<MapEntry> result = new ArrayList<>(slots.length);
+            final List<MapEntry> result = new ArrayList<>();
             for (int i = 0; i < slots.length; i++) {
                 ResultRow slotValue = slots[i];
                 if (slotValue != null) {
@@ -206,74 +158,52 @@ public class CalculateAverage_EduardoSaverin {
     private static class Task implements Runnable {
 
         private final SimplerHashMap results;
-        private final Chunk chunk;
+        private final MemorySegment segment; // this chunk only, offsets start at 0
 
-        public Task(Chunk chunk) {
+        public Task(MemorySegment segment) {
             this.results = new SimplerHashMap();
-            this.chunk = chunk;
+            this.segment = segment;
         }
 
         @Override
         public void run() {
+            final MemorySegment seg = segment;
+            final long end = seg.byteSize();
             // Max length of any city name
-            final byte[] nameBytes = new byte[100];
-            short nameIndex = 0;
-            int ot;
-            int hash = FNV_32_OFFSET;
+            final byte[] nameBytes = new byte[MAX_NAME_LENGTH];
 
-            long i = chunk.start;
-            final long cl = chunk.start + chunk.length;
-            while (i < cl) {
+            long i = 0;
+            while (i < end) {
+                int nameLength = 0;
+                int hash = FNV_32_OFFSET;
                 byte c;
+
                 // 0x3B is ;
-                while ((c = UNSAFE.getByte(i++)) != 0x3B) {
-                    nameBytes[nameIndex++] = c;
+                while ((c = seg.get(JAVA_BYTE, i++)) != 0x3B) {
+                    nameBytes[nameLength++] = c;
                     // FNV-1a hash : https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function
-                    hash ^= c;
+                    hash ^= (c & 0xFF);
                     hash *= FNV_32_PRIME;
                 }
 
-                // Temperature just after Semicolon
-                c = UNSAFE.getByte(i++);
-                // 0x2D is Minus(-)
+                // Temperature just after Semicolon: [-]D.D or [-]DD.D, stored as tenths
                 // Below you will see -48 which is used to convert from ASCII to Integer, 48 represents 0 in ASCII
-                if (c == 0x2D) {
-                    // X.X or XX.X
-                    if (UNSAFE.getByte(i + 3) == 0xA) {
-                        ot = (UNSAFE.getByte(i++) - 48) * 10;
-                    }
-                    else {
-                        ot = (UNSAFE.getByte(i++) - 48) * 100;
-                        ot += (UNSAFE.getByte(i++) - 48) * 10;
-                    }
-                    // Now dot
-                    i++; // Skipping Dot
-                    ot += (UNSAFE.getByte(i++) - 48);
-                    // Make Number Negative Since we detected (-) sign
-                    ot = -ot;
+                c = seg.get(JAVA_BYTE, i++);
+                // 0x2D is Minus(-)
+                final boolean negative = (c == 0x2D);
+                if (negative) {
+                    c = seg.get(JAVA_BYTE, i++);
                 }
-                else {
-                    // X.X or XX.X
-                    if (UNSAFE.getByte(i + 2) == 0xA) {
-                        ot = (c - 48) * 10;
-                    }
-                    else {
-                        ot = (c - 48) * 100;
-                        ot += (UNSAFE.getByte(i++) - 48) * 10;
-                    }
-                    // Now dot
-                    i++; // Skipping Dot
-                    // Number after dot
-                    ot += (UNSAFE.getByte(i++) - 48);
+                int temp = c - 48;
+                while ((c = seg.get(JAVA_BYTE, i++)) != 0x2E) { // 0x2E is Dot(.)
+                    temp = temp * 10 + (c - 48);
                 }
-                // Since Parsed Line, Next thing must be newline
-                i++;
-                hash &= 65535;
-                results.putOrMerge(nameBytes, nameIndex, hash, ot);
-                // Reset
-                nameIndex = 0;
-                hash = FNV_32_OFFSET;
+                temp = temp * 10 + (seg.get(JAVA_BYTE, i++) - 48); // Number after dot
+                i++; // Since Parsed Line, Next thing must be newline
+
+                results.putOrMerge(nameBytes, nameLength, hash, negative ? -temp : temp);
             }
+
             List<MapEntry> all = results.getAll();
             lock.lock();
             try {
@@ -301,17 +231,20 @@ public class CalculateAverage_EduardoSaverin {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        FileChannel fileChannel = FileChannel.open(FILE, READ);
-        List<Chunk> chunks = getChunks(fileChannel);
-        List<Thread> threads = new ArrayList<>();
-        for (Chunk chunk : chunks) {
-            Thread thread = new Thread(new Task(chunk));
-            thread.setPriority(Thread.MAX_PRIORITY); // Make this thread of highest priority
-            threads.add(thread);
-            thread.start();
-        }
-        for (Thread thread : threads) {
-            thread.join();
+        // A shared arena lets every worker thread read the mapping, and closing it
+        // after the join unmaps the file deterministically.
+        try (FileChannel fileChannel = FileChannel.open(FILE, READ);
+                Arena arena = Arena.ofShared()) {
+            MemorySegment file = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileChannel.size(), arena);
+
+            List<Thread> threads = new ArrayList<>();
+            for (Chunk chunk : getChunks(file)) {
+                Task task = new Task(file.asSlice(chunk.start(), chunk.length()));
+                threads.add(Thread.ofPlatform().start(task));
+            }
+            for (Thread thread : threads) {
+                thread.join();
+            }
         }
         System.out.println(new TreeMap<>(resultRowMap));
     }

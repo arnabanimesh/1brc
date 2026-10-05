@@ -15,12 +15,12 @@
  */
 package dev.morling.onebrc;
 
-import sun.misc.Unsafe;
-
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.reflect.Field;
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
@@ -31,10 +31,21 @@ import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+/**
+ * JDK 27 compatible variant: sun.misc.Unsafe is gone (its memory-access methods throw by default since JDK 26),
+ * all raw-address access is replaced by the standard Foreign Function &amp; Memory API (java.lang.foreign, final since JDK 22).
+ *
+ * Differences that follow from this:
+ * - every access is bounds-checked, so the SWAR code must never read past the end of a segment. The file is therefore
+ *   processed as a mapped "main" part plus a small "tail" that is copied into a zero-padded buffer.
+ * - positions are offsets into a MemorySegment instead of absolute addresses, so "not found" is -1 (offset 0 is valid).
+ */
 public class CalculateAverage_artsiomkorzun {
 
     private static final Path FILE = Path.of("./measurements.txt");
     private static final long SEGMENT_SIZE = 2 * 1024 * 1024;
+    private static final long TAIL_SIZE = 256; // the last ~256 bytes are processed from a padded copy
+    private static final long PADDING = 32; // SWAR code reads up to 16 bytes past the end of the last line
     private static final long COMMA_PATTERN = 0x3B3B3B3B3B3B3B3BL;
     private static final long LINE_PATTERN = 0x0A0A0A0A0A0A0A0AL;
     private static final long DOT_BITS = 0x10101000;
@@ -42,18 +53,11 @@ public class CalculateAverage_artsiomkorzun {
     private static final long[] WORD_MASK = { 0, 0, 0, 0, 0, 0, 0, 0, -1 };
     private static final int[] LENGTH_MASK = { 0, 0, 0, 0, 0, 0, 0, 0, -1 };
 
-    private static final Unsafe UNSAFE;
-
-    static {
-        try {
-            Field unsafe = Unsafe.class.getDeclaredField("theUnsafe");
-            unsafe.setAccessible(true);
-            UNSAFE = (Unsafe) unsafe.get(Unsafe.class);
-        }
-        catch (Throwable e) {
-            throw new RuntimeException(e);
-        }
-    }
+    // little-endian byte order, no alignment requirement
+    private static final ValueLayout.OfLong LONG = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfInt INT = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfShort SHORT = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
 
     public static void main(String[] args) throws Exception {
         // for (int i = 0; i < 10; i++) {
@@ -105,10 +109,12 @@ public class CalculateAverage_artsiomkorzun {
     }
 
     private static void execute() throws Exception {
-        MemorySegment fileMemory = map(FILE);
-        long fileAddress = fileMemory.address();
-        long fileSize = fileMemory.byteSize();
-        int segmentCount = (int) ((fileSize + SEGMENT_SIZE - 1) / SEGMENT_SIZE);
+        MemorySegment file = map(FILE);
+        long fileSize = file.byteSize();
+        long tailStart = tailStart(file, fileSize);
+        long tailSize = fileSize - tailStart;
+        MemorySegment tail = copyTail(file, tailStart, tailSize);
+        int segmentCount = (int) ((tailStart + SEGMENT_SIZE - 1) / SEGMENT_SIZE);
 
         AtomicInteger counter = new AtomicInteger();
         AtomicReference<Aggregates> result = new AtomicReference<>();
@@ -117,7 +123,7 @@ public class CalculateAverage_artsiomkorzun {
         Aggregator[] aggregators = new Aggregator[parallelism];
 
         for (int i = 0; i < aggregators.length; i++) {
-            aggregators[i] = new Aggregator(counter, result, fileAddress, fileSize, segmentCount);
+            aggregators[i] = new Aggregator(counter, result, file, tailStart, tail, tailSize, segmentCount);
             aggregators[i].start();
         }
 
@@ -140,15 +146,31 @@ public class CalculateAverage_artsiomkorzun {
         }
     }
 
-    private static long word(long address) {
-        return UNSAFE.getLong(address);
-        /*
-         * if (BYTE_ORDER == ByteOrder.BIG_ENDIAN) {
-         * value = Long.reverseBytes(value);
-         * }
-         *
-         * return value;
-         */
+    /** First line start at or after (fileSize - TAIL_SIZE); everything from here on is handled via the padded copy. */
+    private static long tailStart(MemorySegment file, long fileSize) {
+        long from = fileSize - TAIL_SIZE;
+
+        if (from <= 0) {
+            return 0;
+        }
+
+        for (long i = from; i < fileSize; i++) {
+            if (file.get(BYTE, i) == '\n') {
+                return i + 1;
+            }
+        }
+
+        return fileSize;
+    }
+
+    private static MemorySegment copyTail(MemorySegment file, long tailStart, long tailSize) {
+        MemorySegment tail = Arena.global().allocate(tailSize + PADDING, 8); // zero-initialized
+        MemorySegment.copy(file, tailStart, tail, 0, tailSize);
+        return tail;
+    }
+
+    private static long word(MemorySegment memory, long offset) {
+        return memory.get(LONG, offset);
     }
 
     private static String text(Map<String, Aggregate> aggregates) {
@@ -184,85 +206,84 @@ public class CalculateAverage_artsiomkorzun {
         private static final long SIZE = 128 * ENTRIES;
         private static final long MASK = (ENTRIES - 1) << 7;
 
-        private final long pointer;
+        // entry layout (128 bytes): len:int | hash:int | sum:long | cnt:int | min:short | max:short | key bytes (incl. ';')
+        private final MemorySegment table;
 
         public Aggregates() {
-            long address = UNSAFE.allocateMemory(SIZE + 4096);
-            pointer = (address + 4095) & (~4095);
-            UNSAFE.setMemory(pointer, SIZE, (byte) 0);
+            // zero-initialized, page aligned, shareable between threads (needed for the final merge)
+            table = Arena.global().allocate(SIZE, 4096);
         }
 
+        /** @return entry offset, or -1 if the first probed slot does not hold this key */
         public long find(long word1, long word2, long hash) {
-            long address = pointer + offset(hash);
-            long w1 = word(address + 24);
-            long w2 = word(address + 32);
-            return (word1 == w1) && (word2 == w2) ? address : 0;
+            long entry = offset(hash);
+            long w1 = table.get(LONG, entry + 24);
+            long w2 = table.get(LONG, entry + 32);
+            return (word1 == w1) && (word2 == w2) ? entry : -1;
         }
 
-        public long put(long reference, long word, long length, long hash) {
-            for (long offset = offset(hash);; offset = next(offset)) {
-                long address = pointer + offset;
-                if (equal(reference, word, address + 24, length)) {
-                    return address;
+        public long put(MemorySegment memory, long reference, long word, long length, long hash) {
+            for (long entry = offset(hash);; entry = next(entry)) {
+                if (equal(memory, reference, word, entry + 24, length)) {
+                    return entry;
                 }
 
-                int len = UNSAFE.getInt(address);
+                int len = table.get(INT, entry);
                 if (len == 0) {
-                    alloc(reference, length, hash, address);
-                    return address;
+                    alloc(memory, reference, length, hash, entry);
+                    return entry;
                 }
             }
         }
 
-        public static void update(long address, long value) {
-            long sum = UNSAFE.getLong(address + 8) + value;
-            int cnt = UNSAFE.getInt(address + 16) + 1;
-            short min = UNSAFE.getShort(address + 20);
-            short max = UNSAFE.getShort(address + 22);
+        public void update(long entry, long value) {
+            long sum = table.get(LONG, entry + 8) + value;
+            int cnt = table.get(INT, entry + 16) + 1;
+            short min = table.get(SHORT, entry + 20);
+            short max = table.get(SHORT, entry + 22);
 
-            UNSAFE.putLong(address + 8, sum);
-            UNSAFE.putInt(address + 16, cnt);
+            table.set(LONG, entry + 8, sum);
+            table.set(INT, entry + 16, cnt);
 
             if (value < min) {
-                UNSAFE.putShort(address + 20, (short) value);
+                table.set(SHORT, entry + 20, (short) value);
             }
 
             if (value > max) {
-                UNSAFE.putShort(address + 22, (short) value);
+                table.set(SHORT, entry + 22, (short) value);
             }
         }
 
         public void merge(Aggregates rights) {
-            for (long rightOffset = 0; rightOffset < SIZE; rightOffset += 128) {
-                long rightAddress = rights.pointer + rightOffset;
-                int length = UNSAFE.getInt(rightAddress);
+            MemorySegment other = rights.table;
+
+            for (long rightEntry = 0; rightEntry < SIZE; rightEntry += 128) {
+                int length = other.get(INT, rightEntry);
 
                 if (length == 0) {
                     continue;
                 }
 
-                int hash = UNSAFE.getInt(rightAddress + 4);
+                int hash = other.get(INT, rightEntry + 4);
 
-                for (long offset = offset(hash);; offset = next(offset)) {
-                    long address = pointer + offset;
+                for (long entry = offset(hash);; entry = next(entry)) {
+                    if (equal(entry + 24, other, rightEntry + 24, length)) {
+                        long sum = table.get(LONG, entry + 8) + other.get(LONG, rightEntry + 8);
+                        int cnt = table.get(INT, entry + 16) + other.get(INT, rightEntry + 16);
+                        short min = (short) Math.min(table.get(SHORT, entry + 20), other.get(SHORT, rightEntry + 20));
+                        short max = (short) Math.max(table.get(SHORT, entry + 22), other.get(SHORT, rightEntry + 22));
 
-                    if (equal(address + 24, rightAddress + 24, length)) {
-                        long sum = UNSAFE.getLong(address + 8) + UNSAFE.getLong(rightAddress + 8);
-                        int cnt = UNSAFE.getInt(address + 16) + UNSAFE.getInt(rightAddress + 16);
-                        short min = (short) Math.min(UNSAFE.getShort(address + 20), UNSAFE.getShort(rightAddress + 20));
-                        short max = (short) Math.max(UNSAFE.getShort(address + 22), UNSAFE.getShort(rightAddress + 22));
-
-                        UNSAFE.putLong(address + 8, sum);
-                        UNSAFE.putInt(address + 16, cnt);
-                        UNSAFE.putShort(address + 20, min);
-                        UNSAFE.putShort(address + 22, max);
+                        table.set(LONG, entry + 8, sum);
+                        table.set(INT, entry + 16, cnt);
+                        table.set(SHORT, entry + 20, min);
+                        table.set(SHORT, entry + 22, max);
                         break;
                     }
 
-                    int len = UNSAFE.getInt(address);
+                    int len = table.get(INT, entry);
 
                     if (len == 0) {
-                        UNSAFE.copyMemory(rightAddress, address, length + 24);
+                        MemorySegment.copy(other, rightEntry, table, entry, length + 24L);
                         break;
                     }
                 }
@@ -272,19 +293,18 @@ public class CalculateAverage_artsiomkorzun {
         public Map<String, Aggregate> build() {
             TreeMap<String, Aggregate> set = new TreeMap<>();
 
-            for (long offset = 0; offset < SIZE; offset += 128) {
-                long address = pointer + offset;
-                int length = UNSAFE.getInt(address);
+            for (long entry = 0; entry < SIZE; entry += 128) {
+                int length = table.get(INT, entry);
 
                 if (length != 0) {
                     byte[] array = new byte[length - 1];
-                    UNSAFE.copyMemory(null, address + 24, array, Unsafe.ARRAY_BYTE_BASE_OFFSET, array.length);
-                    String key = new String(array);
+                    MemorySegment.copy(table, BYTE, entry + 24, array, 0, array.length);
+                    String key = new String(array, StandardCharsets.UTF_8);
 
-                    long sum = UNSAFE.getLong(address + 8);
-                    int cnt = UNSAFE.getInt(address + 16);
-                    short min = UNSAFE.getShort(address + 20);
-                    short max = UNSAFE.getShort(address + 22);
+                    long sum = table.get(LONG, entry + 8);
+                    int cnt = table.get(INT, entry + 16);
+                    short min = table.get(SHORT, entry + 20);
+                    short max = table.get(SHORT, entry + 22);
 
                     Aggregate aggregate = new Aggregate(min, max, sum, cnt);
                     set.put(key, aggregate);
@@ -294,12 +314,12 @@ public class CalculateAverage_artsiomkorzun {
             return set;
         }
 
-        private static void alloc(long reference, long length, long hash, long address) {
-            UNSAFE.putInt(address, (int) length);
-            UNSAFE.putInt(address + 4, (int) hash);
-            UNSAFE.putShort(address + 20, Short.MAX_VALUE);
-            UNSAFE.putShort(address + 22, Short.MIN_VALUE);
-            UNSAFE.copyMemory(reference, address + 24, length);
+        private void alloc(MemorySegment memory, long reference, long length, long hash, long entry) {
+            table.set(INT, entry, (int) length);
+            table.set(INT, entry + 4, (int) hash);
+            table.set(SHORT, entry + 20, Short.MAX_VALUE);
+            table.set(SHORT, entry + 22, Short.MIN_VALUE);
+            MemorySegment.copy(memory, reference, table, entry + 24, length);
         }
 
         private static long offset(long hash) {
@@ -310,34 +330,36 @@ public class CalculateAverage_artsiomkorzun {
             return (prev + 128) & (SIZE - 1);
         }
 
-        private static boolean equal(long leftAddress, long leftWord, long rightAddress, long length) {
+        /** key in the input (first words compared raw, last word pre-masked) vs. key in this table */
+        private boolean equal(MemorySegment memory, long leftOffset, long leftWord, long rightOffset, long length) {
             while (length > 8) {
-                long left = UNSAFE.getLong(leftAddress);
-                long right = UNSAFE.getLong(rightAddress);
+                long left = memory.get(LONG, leftOffset);
+                long right = table.get(LONG, rightOffset);
 
                 if (left != right) {
                     return false;
                 }
 
-                leftAddress += 8;
-                rightAddress += 8;
+                leftOffset += 8;
+                rightOffset += 8;
                 length -= 8;
             }
 
-            return leftWord == word(rightAddress);
+            return leftWord == table.get(LONG, rightOffset);
         }
 
-        private static boolean equal(long leftAddress, long rightAddress, long length) {
+        /** key in this table vs. key in another table */
+        private boolean equal(long leftOffset, MemorySegment other, long rightOffset, long length) {
             do {
-                long left = UNSAFE.getLong(leftAddress);
-                long right = UNSAFE.getLong(rightAddress);
+                long left = table.get(LONG, leftOffset);
+                long right = other.get(LONG, rightOffset);
 
                 if (left != right) {
                     return false;
                 }
 
-                leftAddress += 8;
-                rightAddress += 8;
+                leftOffset += 8;
+                rightOffset += 8;
                 length -= 8;
             } while (length > 0);
 
@@ -349,17 +371,21 @@ public class CalculateAverage_artsiomkorzun {
 
         private final AtomicInteger counter;
         private final AtomicReference<Aggregates> result;
-        private final long fileAddress;
-        private final long fileSize;
+        private final MemorySegment file;
+        private final long fileLimit; // main part of the file: lines starting before this offset
+        private final MemorySegment tail;
+        private final long tailSize;
         private final int segmentCount;
 
         public Aggregator(AtomicInteger counter, AtomicReference<Aggregates> result,
-                          long fileAddress, long fileSize, int segmentCount) {
+                          MemorySegment file, long fileLimit, MemorySegment tail, long tailSize, int segmentCount) {
             super("aggregator");
             this.counter = counter;
             this.result = result;
-            this.fileAddress = fileAddress;
-            this.fileSize = fileSize;
+            this.file = file;
+            this.fileLimit = fileLimit;
+            this.tail = tail;
+            this.tailSize = tailSize;
             this.segmentCount = segmentCount;
         }
 
@@ -367,90 +393,17 @@ public class CalculateAverage_artsiomkorzun {
         public void run() {
             Aggregates aggregates = new Aggregates();
 
-            for (int segment; (segment = counter.getAndIncrement()) < segmentCount;) {
+            int segment;
+            while ((segment = counter.getAndIncrement()) < segmentCount) {
                 long position = SEGMENT_SIZE * segment;
-                long size = Math.min(SEGMENT_SIZE + 1, fileSize - position);
-                long start = fileAddress + position;
-                long end = start + size;
+                long end = Math.min(position + SEGMENT_SIZE + 1, fileLimit);
+                long start = (segment > 0) ? next(file, position) : position;
+                process(aggregates, file, start, end);
+            }
 
-                if (segment > 0) {
-                    start = next(start);
-                }
-
-                long chunk = (end - start) / 3;
-                long left = next(start + chunk);
-                long right = next(start + chunk + chunk);
-
-                Chunk chunk1 = new Chunk(start, left);
-                Chunk chunk2 = new Chunk(left, right);
-                Chunk chunk3 = new Chunk(right, end);
-
-                while (chunk1.has() && chunk2.has() && chunk3.has()) {
-                    long word1 = word(chunk1.position);
-                    long word2 = word(chunk2.position);
-                    long word3 = word(chunk3.position);
-                    long word4 = word(chunk1.position + 8);
-                    long word5 = word(chunk2.position + 8);
-                    long word6 = word(chunk3.position + 8);
-
-                    long separator1 = separator(word1);
-                    long separator2 = separator(word2);
-                    long separator3 = separator(word3);
-                    long separator4 = separator(word4);
-                    long separator5 = separator(word5);
-                    long separator6 = separator(word6);
-
-                    long pointer1 = find(aggregates, chunk1, word1, word4, separator1, separator4);
-                    long pointer2 = find(aggregates, chunk2, word2, word5, separator2, separator5);
-                    long pointer3 = find(aggregates, chunk3, word3, word6, separator3, separator6);
-
-                    long value1 = value(chunk1);
-                    long value2 = value(chunk2);
-                    long value3 = value(chunk3);
-
-                    Aggregates.update(pointer1, value1);
-                    Aggregates.update(pointer2, value2);
-                    Aggregates.update(pointer3, value3);
-                }
-
-                while (chunk1.has()) {
-                    long word1 = word(chunk1.position);
-                    long word2 = word(chunk1.position + 8);
-
-                    long separator1 = separator(word1);
-                    long separator2 = separator(word2);
-
-                    long pointer = find(aggregates, chunk1, word1, word2, separator1, separator2);
-                    long value = value(chunk1);
-
-                    Aggregates.update(pointer, value);
-                }
-
-                while (chunk2.has()) {
-                    long word1 = word(chunk2.position);
-                    long word2 = word(chunk2.position + 8);
-
-                    long separator1 = separator(word1);
-                    long separator2 = separator(word2);
-
-                    long pointer = find(aggregates, chunk2, word1, word2, separator1, separator2);
-                    long value = value(chunk2);
-
-                    Aggregates.update(pointer, value);
-                }
-
-                while (chunk3.has()) {
-                    long word1 = word(chunk3.position);
-                    long word2 = word(chunk3.position + 8);
-
-                    long separator1 = separator(word1);
-                    long separator2 = separator(word2);
-
-                    long pointer = find(aggregates, chunk3, word1, word2, separator1, separator2);
-                    long value = value(chunk3);
-
-                    Aggregates.update(pointer, value);
-                }
+            // exactly one thread draws the ticket == segmentCount and takes care of the tail
+            if (segment == segmentCount) {
+                process(aggregates, tail, 0, tailSize);
             }
 
             while (!result.compareAndSet(null, aggregates)) {
@@ -462,9 +415,71 @@ public class CalculateAverage_artsiomkorzun {
             }
         }
 
-        private static long next(long position) {
+        /** Processes all lines that start in [start, end); start must be a line start. */
+        private static void process(Aggregates aggregates, MemorySegment memory, long start, long end) {
+            if (start >= end) {
+                return;
+            }
+
+            long chunk = (end - start) / 3;
+            long left = Math.min(next(memory, start + chunk), end);
+            long right = Math.min(next(memory, start + chunk + chunk), end);
+
+            Chunk chunk1 = new Chunk(start, left);
+            Chunk chunk2 = new Chunk(left, right);
+            Chunk chunk3 = new Chunk(right, end);
+
+            while (chunk1.has() && chunk2.has() && chunk3.has()) {
+                long word1 = word(memory, chunk1.position);
+                long word2 = word(memory, chunk2.position);
+                long word3 = word(memory, chunk3.position);
+                long word4 = word(memory, chunk1.position + 8);
+                long word5 = word(memory, chunk2.position + 8);
+                long word6 = word(memory, chunk3.position + 8);
+
+                long separator1 = separator(word1);
+                long separator2 = separator(word2);
+                long separator3 = separator(word3);
+                long separator4 = separator(word4);
+                long separator5 = separator(word5);
+                long separator6 = separator(word6);
+
+                long entry1 = find(aggregates, memory, chunk1, word1, word4, separator1, separator4);
+                long entry2 = find(aggregates, memory, chunk2, word2, word5, separator2, separator5);
+                long entry3 = find(aggregates, memory, chunk3, word3, word6, separator3, separator6);
+
+                long value1 = value(memory, chunk1);
+                long value2 = value(memory, chunk2);
+                long value3 = value(memory, chunk3);
+
+                aggregates.update(entry1, value1);
+                aggregates.update(entry2, value2);
+                aggregates.update(entry3, value3);
+            }
+
+            drain(aggregates, memory, chunk1);
+            drain(aggregates, memory, chunk2);
+            drain(aggregates, memory, chunk3);
+        }
+
+        private static void drain(Aggregates aggregates, MemorySegment memory, Chunk chunk) {
+            while (chunk.has()) {
+                long word1 = word(memory, chunk.position);
+                long word2 = word(memory, chunk.position + 8);
+
+                long separator1 = separator(word1);
+                long separator2 = separator(word2);
+
+                long entry = find(aggregates, memory, chunk, word1, word2, separator1, separator2);
+                long value = value(memory, chunk);
+
+                aggregates.update(entry, value);
+            }
+        }
+
+        private static long next(MemorySegment memory, long position) {
             while (true) {
-                long word = word(position);
+                long word = word(memory, position);
                 long match = word ^ LINE_PATTERN;
                 long line = (match - 0x0101010101010101L) & (~match & 0x8080808080808080L);
 
@@ -477,7 +492,8 @@ public class CalculateAverage_artsiomkorzun {
             }
         }
 
-        private static long find(Aggregates aggregates, Chunk chunk, long word1, long word2, long separator1, long separator2) {
+        private static long find(Aggregates aggregates, MemorySegment memory, Chunk chunk,
+                                 long word1, long word2, long separator1, long separator2) {
             boolean small = (separator1 | separator2) != 0;
             long start = chunk.position;
             long hash;
@@ -491,10 +507,10 @@ public class CalculateAverage_artsiomkorzun {
                 hash = mix(word1 ^ word2);
 
                 chunk.position += length1 + (length2 & LENGTH_MASK[length1]) + 1;
-                long pointer = aggregates.find(word1, word2, hash);
+                long entry = aggregates.find(word1, word2, hash);
 
-                if (pointer != 0) {
-                    return pointer;
+                if (entry >= 0) {
+                    return entry;
                 }
 
                 word = (separator1 == 0) ? word2 : word1;
@@ -504,7 +520,7 @@ public class CalculateAverage_artsiomkorzun {
                 hash = word1 ^ word2;
 
                 while (true) {
-                    word = word(chunk.position);
+                    word = word(memory, chunk.position);
                     long separator = separator(word);
 
                     if (separator == 0) {
@@ -521,11 +537,11 @@ public class CalculateAverage_artsiomkorzun {
             }
 
             long length = chunk.position - start;
-            return aggregates.put(start, word, length, hash);
+            return aggregates.put(memory, start, word, length, hash);
         }
 
-        private static long value(Chunk chunk) {
-            long num = word(chunk.position);
+        private static long value(MemorySegment memory, Chunk chunk) {
+            long num = word(memory, chunk.position);
             long dot = dot(num);
             long value = value(num, dot);
             chunk.position += (dot >> 3) + 3;
